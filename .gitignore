@@ -1,0 +1,22 @@
+# Cookie/pool chứa session Google — KHÔNG BAO GIỜ commit
+pools/*
+!pools/example.json
+
+# Báo cáo deep research
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

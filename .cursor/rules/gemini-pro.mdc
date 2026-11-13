@@ -1,0 +1,105 @@
+# Rule cho phiên mới trong repo my-gemini-pro
+
+**Mục tiêu dự án:** điều khiển Gemini Deep Research trên `gemini.google.com` bằng cookie của
+tài khoản Google AI Pro **đã trả phí** (qua `gemini_webapi`), không dùng AI Studio
+Interactions API (vốn tính phí pay-as-you-go riêng).
+
+---
+
+## 1. Đọc file bàn giao TRƯỚC khi làm bất cứ việc gì
+
+```
+docs/HANDOFF.md      ← bắt buộc đọc đầu tiên, chứa toàn bộ context
+docs/FINDINGS.md     ← bằng chứng + primary source cho mọi claim
+docs/ARCHITECTURE.md ← thiết kế hệ thống
+docs/COOKIE-SETUP.md ← cách lấy cookie
+```
+
+Khi user nhắn `continue`, đọc `docs/HANDOFF.md` trước, rồi báo lại trạng thái hiện tại
+và hỏi bước tiếp theo nếu còn blocker.
+
+---
+
+## 2. Nguyên tắc bất di bất dịch
+
+1. **KHÔNG dùng AI Studio Interactions API.** Nó tính phí riêng, không trừ vào gói AI Pro.
+   Đã verify: OAuth Antigravity → HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`.
+2. **KHÔNG dùng `int04/ChatCmd`** cho Gemini — repo đó không có một dòng code Gemini nào.
+3. **KHÔNG đọc cookie Chrome/Edge từ ngoài tiến trình** — Chrome ≥127 dùng app-bound
+   encryption (prefix `v20`), đã thử và thất bại mọi cách.
+4. **KHÔNG copy cookie từ profile đang mở** — rủi ro "Evil Clone" → Google logout toàn diện.
+5. **KHÔNG commit cookie vào git.** `pools/` và `reports/` đã gitignore.
+6. **KHÔNG claim gì chưa verify.** Mọi claim load-bearing phải có primary source hoặc
+   output thật từ tool.
+
+---
+
+## 3. Stack
+
+| Thành phần | Giá trị |
+|---|---|
+| Thư viện | `gemini-webapi` (PyPI), cài sẵn vào Python 3.14.8 |
+| Python | 3.14.8 (`C:\Users\kimvi\AppData\Local\Python\pythoncore-3.14-64`) |
+| Repo gốc của thư viện | <https://github.com/HanaokaYuzu/Gemini-API> — 3.8k stars, cập nhật 2026-11-10 |
+| MCP server sẵn có (tham khảo) | <https://github.com/vadim-a-yegorov/mcp-gemini-deep-research> |
+| `gemini_mcp.py` (hiện có) | `C:\Users\kimvi\.cursor\bin\gemini_mcp.py` — 1178 dòng, 2 pool Antigravity |
+
+---
+
+## 4. Ba luồng hệ thống — đừng lẫn
+
+| Luồng | Công cụ | Quota |
+|---|---|---|
+| Antigravity CLI (code task) | `agy.exe` Windows + `agy` WSL2 | 2 pool Antigravity (~30% / ~96.5%) |
+| **Deep Research** | `gemini_webapi` + cookie | **Allowance Gemini Advanced (gói đã trả)** |
+| AI Studio API | Interactions API | ~~Tiền riêng~~ ❌ |
+
+---
+
+## 5. Pool mapping
+
+| Pool | Cookie file | Tài khoản |
+|---|---|---|
+| `windows` | `pools/windows.json` | `mmeo44244@gmail.com` |
+| `wsl` | `pools/wsl.json` | `catkingmv@gmail.com` |
+
+Tên pool khớp với pool Antigravity để `auto` routing nhất quán.
+
+---
+
+## 6. Workflow chuẩn
+
+```powershell
+# Kiểm tra trạng thái cookie hiện tại
+python scripts\scan_browser_cookies.py
+
+# Kiểm tra pool đã cấu hình
+python scripts\setup_pool.py validate
+
+# Test thật 1 câu
+python scripts\setup_pool.py probe
+```
+
+---
+
+## 7. Khi cần verify một claim về `gemini_webapi`
+
+Đọc source thật, **không** đoán:
+
+```powershell
+$src = "$env:TEMP\gemini-webapi\src\gemini_webapi"
+# nếu chưa clone:
+git clone --depth 1 https://github.com/HanaokaYuzu/Gemini-API.git "$env:TEMP\gemini-webapi"
+
+rg -n "deep_research|_assert_deep_research_capable|inspect_account_status" $src
+rg -n "GRPC\.|DEEP_RESEARCH" "$src\constants.py"
+```
+
+---
+
+## 8. Báo cáo
+
+- Báo cáo bằng **tiếng Việt**.
+- Nêu rõ: đã làm gì, verify bằng cách nào, còn blocker gì.
+- Nếu có dùng quota Gemini (Antigravity) → báo dòng quota.
+- Không hứa kết quả Deep Research nếu chưa chạy thật.
