@@ -15,9 +15,36 @@ Hệ thống **điều khiển Gemini Deep Research thông qua gói Google AI Pr
 - [x] Xác minh `ChatCmd` (`int04/ChatCmd`) **không dùng được** cho Gemini — repo chỉ có bridge ChatGPT, 0 tham chiếu Gemini
 - [x] Xác định giải pháp: `HanaokaYuzu/Gemini-API` (`gemini_webapi`), 3.8k stars, cập nhật 2026-11-10
 - [x] Quét cookie: **cả 2 profile Chrome đều đã đăng nhập Gemini** (`mmeo44244`, `catkingmv`)
-- [ ] Export cookie từ trong Chrome (Cookie-Editor) → `pools/`
-- [ ] Viết `tools/gemini_dr_mcp.py` (pool kép + auto-routing)
-- [ ] Tích hợp vào `gemini_mcp.py` hiện có
+- [x] Export cookie cho pool `windows` (`mmeo44244@gmail.com`) → `pools/windows.json`
+- [x] Viết `tools/gemini_pool.py` + `tools/gemini_dr_mcp.py` (pool kép + auto-routing)
+- [x] Tích hợp vào `gemini_mcp.py` (thêm `gemini_dr_*` tools)
+- [x] Test end-to-end: Deep Research chạy thật, trả report + sources
+- [x] **Orchestrator** — chạy task dài không chặn agent (Deep Research / chat / canvas / Antigravity)
+- [x] Tự động tạo hồ sơ Chrome cho acc Google mới (song song hoá pool)
+- [x] GUI dashboard (Tkinter) + đóng gói `.exe`
+- [ ] Export cookie cho pool `wsl` (`catkingmv@gmail.com`)
+- [ ] Bật `gemini-dr` + `orchestrator` MCP server trong Cursor (đã ghi vào `~/.cursor/mcp.json`, cần reload)
+
+## Orchestrator — task dài không chặn agent
+
+Vấn đề: gọi Gemini Deep Research / Antigravity trực tiếp = agent phải chờ
+30-60 phút, và bạn không biết Gemini đang làm gì.
+
+Giải pháp: tách "chạy" khỏi "chờ". Job chạy ở process con độc lập, ghi
+tiến độ vào SQLite; agent làm việc khác rồi quay lại lấy kết quả.
+
+```powershell
+# Submit -> nhận job_id ngay, KHÔNG chặn
+python -m orchestrator.orch_cli submit deep_research "So sánh X vs Y năm 2026" --pool windows
+
+# Chạy NỀN -> Cursor tự đánh thức bạn khi job xong
+python -m orchestrator.orch_cli watch j_xxxxx
+
+# GUI (tuỳ chọn)
+python -m orchestrator.gui
+```
+
+Xem `docs/ORCHESTRATOR-USAGE.md`.
 
 ## Cấu trúc
 
@@ -28,14 +55,30 @@ my-gemini-pro/
 │   ├── HANDOFF.md              ← bàn giao cho phiên mới (đọc file này trước)
 │   ├── ARCHITECTURE.md
 │   ├── FINDINGS.md             ← kết quả nghiên cứu + nguồn
-│   └── COOKIE-SETUP.md
+│   ├── COOKIE-SETUP.md
+│   ├── ORCHESTRATOR.md         ← kiến trúc orchestrator
+│   └── ORCHESTRATOR-USAGE.md   ← hướng dẫn dùng
+├── orchestrator/               ← Orchestrator: chạy task dài KHÔNG chặn agent
+│   ├── store.py                ← SQLite job store + event log
+│   ├── dispatch.py             ← submit / spawn / wait / cancel
+│   ├── orch_mcp.py             ← MCP server (cổng gọi của agent)
+│   ├── orch_cli.py             ← CLI (dùng cho shell background)
+│   ├── gui.py                  ← Tkinter dashboard
+│   ├── chrome_profile.py       ← tạo hồ sơ Chrome cho multi-account
+│   ├── selftest.py             ← smoke test
+│   ├── orchestrator.spec       ← PyInstaller spec (.exe)
+│   ├── skills/orchestrator/SKILL.md
+│   └── runners/
+│       ├── gemini.py           ← Deep Research / chat / canvas
+│       └── agy.py              ← Antigravity CLI (NDJSON stream)
 ├── tools/
-│   ├── gemini_dr_mcp.py        ← MCP server Deep Research (chưa viết)
-│   └── gemini_pool.py          ← pool config + auto-select (chưa viết)
+│   ├── gemini_dr_mcp.py        ← MCP server Deep Research
+│   └── gemini_pool.py          ← pool config + auto-select + quota
 ├── scripts/
 │   ├── continue.py             ← entrypoint cho phiên mới (nhắn "continue")
 │   ├── scan_browser_cookies.py ← quét trạng thái cookie trên máy
-│   └── setup_pool.py           ← tạo/validate/probe pool
+│   ├── setup_pool.py           ← tạo/validate/probe pool
+│   └── build_exe.py            ← đóng gói .exe
 ├── research/
 │   └── chatcmd-analysis.md     ← phân tích int04/ChatCmd (đã loại)
 ├── pools/                      ← cookie export (gitignore, KHÔNG commit)
@@ -57,9 +100,30 @@ python scripts\setup_pool.py setup --export <file.json> --name windows --account
 python scripts\setup_pool.py validate
 python scripts\setup_pool.py probe
 
-# 3. Test một deep research thật
-python -c "import asyncio; from gemini_webapi import GeminiClient; ..."
+# 3. Test một deep research thật (đóng Chrome trước để tránh evil-clone)
+python -c "import asyncio,sys; sys.path.insert(0,'tools'); from gemini_dr_mcp import gemini_dr_research; print(asyncio.run(gemini_dr_research('Rust vs Go: quan ly bo nho')))"
 ```
+
+## MCP tools
+
+Server `gemini-dr` (`tools/gemini_dr_mcp.py`) + các tool `gemini_dr_*` đã gắn
+thêm vào server `gemini` (`~/.cursor/bin/gemini_mcp.py`):
+
+| Tool | Việc |
+|---|---|
+| `gemini_dr_research(query, pool, timeout, model)` | Chạy full research → report markdown + sources |
+| `gemini_dr_plan(query, pool, model)` | Chỉ xem plan, **chưa** chạy (để duyệt scope) |
+| `gemini_dr_collect(cid, pool, timeout)` | Thu report của task đang chạy (dùng khi research bị timeout) |
+| `gemini_dr_quota(pool)` | Headroom 5h + weekly của mỗi pool |
+| `gemini_dr_account()` | Email ↔ pool mapping |
+
+### ⚠️ Model bắt buộc
+
+Deep Research **không** chạy trên mọi model. Model mà account để mặc định thường
+*từ chối* với câu "tôi chỉ là mô hình ngôn ngữ" thay vì trả plan. Bridge tự dò
+qua các model ứng viên và cache model đã biết vào `pools/<name>.json` (`dr_model`).
+
+Xem upstream issue: <https://github.com/HanaokaYuzu/Gemini-API/issues/359>
 
 ## Về "nhắn continue ở phiên khác"
 

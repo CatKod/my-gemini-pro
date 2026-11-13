@@ -4,7 +4,9 @@
 > Nó chứa đủ context để tiếp tục mà không cần đọc transcript cũ.
 
 **Ngày bàn giao:** 2026-11-13 20:11 (UTC+7)
-**Trạng thái:** nghiên cứu xong, chưa viết code production.
+**Cập nhật:** 2026-11-14 00:45 — cookie Gemini **tự động hoá** (mục 11).
+**Trạng thái:** nghiên cứu xong + Orchestrator đã chạy thật end-to-end +
+cookie tự động sync (không cần Cookie-Editor nữa).
 **Người dùng:** `CatKod` (GitHub), máy Windows 11 + WSL2 Ubuntu.
 
 **Repo GitHub:** <https://github.com/CatKod/my-gemini-pro>
@@ -313,3 +315,205 @@ Thêm `deep_research: bool = False` vào `gemini_task()`. Khi `True` → route s
 - Cookie extraction trên Windows: <https://github.com/steipete/oracle/issues/51>
 - Evil-clone risk: <https://github.com/TNLegend/Chimera>
 - ChatCmd (đã loại): <https://github.com/int04/ChatCmd>
+
+---
+
+## 10. Orchestrator — chạy task dài KHÔNG chặn agent (2026-11-13)
+
+### Vấn đề user nêu
+
+Gọi `gemini_dr_research` / `agy` trực tiếp = agent **ngồi chờ** 30-60 phút,
+và user không biết Gemini đang làm gì.
+
+### Giải pháp đã build
+
+Tách "chạy" khỏi "chờ": job chạy ở **process con độc lập**, ghi tiến độ vào
+SQLite, agent làm việc khác rồi quay lại lấy kết quả.
+
+```
+agent ──orch_submit──▶ SQLite ──spawn──▶ runner process (detached)
+agent ◀──orch_result──────────────────── SQLite (DONE)
+```
+
+Wake-up: agent chạy **nền** `python -m orchestrator.orch_cli watch <job_id>`
+→ Cursor tự inject `<system_notification>` khi tiến trình kết thúc.
+**Không cần daemon, không cần hook, không cần poll.**
+
+### Files
+
+| File | Vai trò |
+|---|---|
+| `orchestrator/store.py` | SQLite job store + event log (WAL, multi-process safe) |
+| `orchestrator/dispatch.py` | submit / spawn (DETACHED) / wait / cancel |
+| `orchestrator/orch_mcp.py` | MCP server stdio — 7 tools `orch_*` |
+| `orchestrator/orch_cli.py` | CLI cho shell background |
+| `orchestrator/gui.py` | Tkinter dashboard (view của SQLite) |
+| `orchestrator/chrome_profile.py` | Tạo hồ sơ Chrome cho acc Google mới |
+| `orchestrator/runners/gemini.py` | Deep Research / chat / canvas |
+| `orchestrator/runners/agy.py` | Antigravity CLI, parse NDJSON stream |
+| `orchestrator/selftest.py` | Smoke test MCP thật (`SELFTEST PASS`) |
+
+Docs: `docs/ORCHESTRATOR.md` (kiến trúc), `docs/ORCHESTRATOR-USAGE.md` (cách dùng).
+
+### Kinds đã hỗ trợ
+
+`deep_research` · `chat` · `canvas` (browser) · `canvas_api` (fallback) ·
+`antigravity` · `chrome_profile`
+
+### Bằng chứng đã verify (không phải claim)
+
+- `orch_submit` + `orch_result` cho `chat` → text `"PONG"` / `"SELFTEST"` /
+  `"FINAL"` đúng (3 lần chạy).
+- Antigravity runner parse được NDJSON thật của `agy --output-format stream-json`
+  (events: `init`, `step_update` với `text_delta`, `result`).
+  1 lần chạy trả `status=ERROR` do **hết capacity model phía server**
+  (`UNAVAILABLE (503) No capacity available for model gemini-3.8-flash-high`)
+  — không phải lỗi code. Runner đã giữ `partial_response` khi có.
+- `orchestrator.chrome_profile list` → đọc đúng 2 profile Chrome thật
+  (`Default` = mmeo44244, `Profile 1` = catkingmv).
+- `orchestrator.chrome_profile create --name "Canvas Acc"` → tạo thật
+  `Profile 2`, xuất hiện trong `info_cache` + `profiles_order`.
+- Canvas browser runner → Chrome spawn + CDP connect thành công, fail **đúng
+  cách** với thông báo "profile chưa đăng nhập Google".
+- `orchestrator.selftest` → `SELFTEST PASS` (7 tools, submit chat thật).
+- Build `.exe`: PyInstaller onedir → `orchestrator-cli.exe` (68 MB cả thư mục),
+  **startup median 161 ms** (nhanh hơn Nuitka 1040 ms). GUI exe mở được,
+  hiển thị đúng tiếng Việt.
+- `sync-gemini-capabilities.py` → `orchestrator` đã mirror sang Gemini CLI
+  (15 MCP servers, +1 mới).
+
+### Bẫy đã gặp (đừng lặp lại)
+
+| Bẫy | Sửa |
+|---|---|
+| `output.text` trong `generate_content_stream` là **cumulative** → "PONG"+"PONG"+"PONG" | Dùng `output.text_delta` |
+| DR plan nằm ở frame **giữa** stream, không phải frame cuối | Quét toàn bộ stream, giữ frame có plan |
+| `deep_research_document.ready` là cờ authoritative — content rỗng KHÔNG phải xong | Chờ `ready AND content` |
+| Model mặc định của account có thể **từ chối** DR (refusal, không phải lỗi API) | Dò qua `DR_MODEL_CANDIDATES` |
+| PowerShell làm hỏng JSON inline (`--params '{"a":1}'`) | `--params @file.json` (đã hỗ trợ) |
+| Chrome đang chạy → ghi đè `Local State`, hồ sơ vừa tạo biến mất | Bắt buộc đóng Chrome trước khi tạo |
+| `mcp` 2.x đã đổi `FastMCP` → `MCPServer` | `from mcp.server.mcpserver import MCPServer` |
+
+### MCP server đã đăng ký
+
+`C:\Users\kimvi\.cursor\mcp.json` → key `orchestrator`
+(`python.exe -m orchestrator.orch_mcp`, `PYTHONPATH` = repo root).
+**Cần reload Cursor window** để nạp.
+
+### Còn lại
+
+1. **Reload Cursor window** → MCP `orchestrator` xuất hiện trong tool list.
+2. ~~**Export cookie lại** cho pool `windows`~~ → **ĐÃ GIẢI QUYẾT** bằng cookie
+   tự động (mục 11). Chạy `sync` là được, không cần Cookie-Editor nữa.
+3. Export cookie pool `wsl` (`catkingmv@gmail.com`) → dùng `adopt` 1 lần với
+   file export từ Chrome profile "Vĩnh", hoặc đơn giản hơn:
+   `python -m orchestrator.cookie_sync login --account catkingmv` → đăng nhập
+   Google trong Chrome riêng → `sync --account catkingmv` (pool `wsl` tự map).
+4. Đăng nhập Google vào Chrome profile `Profile 2` ("Canvas Acc") → `canvas`
+   (browser) mới sinh được artifact thật.
+5. ~~Test `deep_research` end-to-end qua orchestrator~~ → **ĐÃ XONG**
+   (job `j_502980b1f499`, 33 nguồn) + chat end-to-end (`j_2ed016af1eca`).
+6. `Profile 2` đã tạo nhưng chưa đăng nhập — có thể xoá nếu không dùng:
+   xoá thư mục `Profile 2` + entry trong `Local State`.
+
+---
+
+## 11. ⭐ Cookie Gemini tự động hoá (2026-11-14)
+
+**Vấn đề:** trước đây mỗi khi session hết hạn phải: mở Chrome → Gemini →
+Cookie-Editor → Export → paste. User muốn tự động hoá.
+
+**Kết quả:** đã giải quyết triệt để, không cần extension nữa.
+
+### Files mới
+
+| File | Vai trò |
+|---|---|
+| `orchestrator/cdp.py` | CDP client tối giểu (websocket-client thuần Python, **không** kéo Playwright 109 MB) |
+| `orchestrator/cookie_sync.py` | Nghiệp vụ `adopt` / `sync` / `status` |
+
+### Cách dùng
+
+```powershell
+# 1 lần cho mỗi account — nhận nuôi session vào Chrome riêng của orchestrator
+python -m orchestrator.cookie_sync adopt --account mmeo `
+    --export "D:\GitHub\.gemini-pool\chrome-default.json"
+
+# mỗi lần cần cookie mới — tự động, không cần user thao tác
+python -m orchestrator.orch_cli cookie sync --account mmeo
+python -m orchestrator.orch_cli cookie status --account mmeo
+```
+
+> `--pool` là **optional** — orchestrator tự map account → pool
+> (`ACCOUNT_POOLS` trong `orchestrator/cookie_sync.py`): `mmeo` → `windows`,
+> `catkingmv` → `wsl`. Account mới thì thêm vào dict đó hoặc truyền `--pool`.
+
+MCP: `orch_cookie_sync(action="sync"|"adopt"|"status", account=..., pool=...)`.
+GUI: nút **"Đồng bộ cookie"**.
+
+### Nguyên tắc (đã verify bằng script thật, không phải suy đoán)
+
+Chrome ≥127 mã hoá cookie bằng **App-Bound Encryption** (`v20`) + **Device Bound
+Session** (DBSC). Google bind session vào *đúng user-data-dir nơi nó được tạo*.
+
+| Hướng đã thử | Kết quả thực nghiệm |
+|---|---|
+| Đọc `Network/Cookies` ngoài tiến trình | Không giải mã được |
+| **Copy** profile → user-data-dir khác | Chrome **xoá cookie** (65 → 0) — DBSC không khớp. Profile thật thì **an toàn** |
+| `--remote-debugging-port` + user-data-dir default | Chrome ≥136 **từ chối** mở port (không set được policy: `HKCU\Software\Policies` bị từ chối ghi) |
+| `--remote-debugging-port` + **short path 8.3** (`USERDA~1`) | Port mở được ✅ nhưng cookie vẫn **không giải mã** (Chrome so sánh path đã resolve) |
+| `--remote-debugging-pipe` | Windows cần handle riêng; `stdin`/`stdout` không dùng được (`OSError 22`) |
+| **Chrome riêng + cấy cookie qua CDP** | ✅ **thành công** |
+
+### Lời giải
+
+Orchestrator sở hữu **Chrome riêng** tại `%LOCALAPPDATA%\OrchestratorChrome\<account>\`:
+
+- **adopt** (1 lần): `Network.setCookie` cấy cookie từ file export → Chrome ghi
+  lại kèm DBSC key **của profile riêng** → browser đăng nhập thật.
+  Verify: trang Gemini hiện "Thư viện", "Đã lên lịch", lịch sử chat.
+- **sync** (mỗi lần): `Storage.getCookies` đọc cookie live → ghi `pools/<pool>.json`.
+- **đóng graceful**: `Browser.close` (exit code 0) để Chrome flush cookie vào DB.
+
+### Bẫy đã gặp
+
+| Bẫy | Sửa |
+|---|---|
+| Kill cứng Chrome (`terminate()`) → session cookie **mất** (không flush DB) | Luôn đóng bằng CDP `Browser.close` |
+| `Network.setCookie` báo lỗi ở browser-level | Phải attach page session (`Target.attachToTarget`) rồi gọi kèm `sessionId` |
+| `Storage.getCookies` trả 0 cookie | Phải dùng **browser-level** session, không phải page-level |
+| Chrome flush cookie vào DB **chỉ khi thoát graceful** | `Browser.close` → `proc.wait()` phải trả exit code 0 |
+| `.exe` ghi pool nhầm vào `dist/.../_internal/pools` | `_resolve_pools_dir()` xử lý `sys.frozen` (cwd → `%LOCALAPPDATA%\Orchestrator\pools`) |
+| `status`/`sync` map pool theo tên account (`mmeo.json`) thay vì pool thật (`windows.json`) | `ACCOUNT_POOLS` + `default_pool_for(account)` |
+| Đọc `Network/Cookies` offline fail `WinError 32` khi Chrome đang chạy | Báo `cookies_in_db: -1` (= không đọc được) thay vì `0` (nghĩa là không có cookie) — kiểm tra `pool_cookies` thay thế |
+
+### Rủi ro
+
+- **Evil Clone**: profile Chrome của user **không bao giờ bị đụng** → không có
+  rủi ro này. Orchestrator dùng user-data-dir riêng, không cần đóng Chrome.
+- **Session chết**: nếu Google chết session, `sync` báo lỗi rõ ràng → chạy
+  lại `adopt` (cần file export Cookie-Editor mới, hoặc user đăng nhập lại
+  trong Chrome riêng của orchestrator).
+
+### Đã verify
+
+- `adopt` → `signed_in: true`, `cookies_seeded: 15`, browser hiện lịch sử chat.
+- `sync` → `ok: true`, 20 cookie, `pools/windows.json` cập nhật.
+- Đọc lại sau khi đóng Chrome → cookie vẫn còn (20 cookie trong DB).
+- `orchestrator-cli.exe cookie sync` → chạy đúng từ bản đóng gói.
+- Session trong file Cookie-Editor vẫn sống: `init OK`, quota 46617/48384.
+- **`deep_research` end-to-end** (job `j_502980b1f499`): DONE, report 12.398 bytes
+  tại `reports/20261114-004107-b-nh-rust-v-go.md`, **33 nguồn**, model
+  `gemini-4-hydrogen`, pool `windows`, `cid=c_9fc798e41e78b7ce`.
+  → Chuỗi đầy đủ đã chạy thật: *cookie tự động sync → API → plan → dispatch →
+  report có citation*.
+- `orchestrator.selftest` → `SELFTEST PASS` (8 tools, chat thật trả "SELFTEST").
+- **Chat end-to-end sau khi `sync` tự động** (job `j_2ed016af1eca`): pool
+  `windows`, text `"SYNC_OK"`, `cid=c_707597ae1ecb3e9b` → cookie tự động dùng
+  được thật, không chỉ Deep Research.
+- `cookie sync --account mmeo` → 21 cookie, ghi đúng `pools/windows.json`
+  (mapping account → pool tự động).
+- `cookie status --account mmeo` → `pool_cookies: 2`, `cookies_in_db: -1`
+  (Chrome giữ lock — đúng semantics sau fix).
+- `python -m orchestrator.selftest` → `SELFTEST PASS` sau khi sửa mapping.
+

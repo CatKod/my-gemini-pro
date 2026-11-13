@@ -113,6 +113,117 @@ Rồi dùng WebSocket `Network.getAllCookies` / `Storage.getCookies` để lấy
 
 ---
 
+## 3. ⭐ Cách C — Tự động hoá hoàn toàn (orchestrator, KHÔNG cần extension)
+
+Đây là cách **được khuyến nghị** hiện nay. Bạn chỉ cần làm **một lần** cho mỗi
+tài khoản; sau đó orchestrator tự lấy cookie mới mỗi khi cần.
+
+### 3.1. Nguyên tắc
+
+Orchestrator sở hữu **một Chrome riêng** cho mỗi account, đặt tại:
+
+```
+%LOCALAPPDATA%\OrchestratorChrome\<account>\
+```
+
+Chrome đó **không** dùng chung profile với Chrome của bạn → không lo
+"Evil Clone", không xoá session cá nhân, không cần đóng Chrome.
+
+### 3.2. Quy trình 2 bước
+
+**Bước 1 — login (cách ưu tiên, không cần extension):**
+
+```powershell
+python -m orchestrator.cookie_sync login --account catkingmv
+```
+
+Chrome riêng của orchestrator mở ra. Bạn đăng nhập Google bình thường, mở
+tab `https://gemini.google.com/app` để chắc chắn đã đăng nhập, rồi **đóng
+Chrome**. Xong.
+
+**Bước 1' — adopt (nếu đã có file export Cookie-Editor):**
+
+```powershell
+python -m orchestrator.cookie_sync adopt `
+    --account mmeo `
+    --export "D:\GitHub\.gemini-pool\chrome-default.json" `
+    --pool windows `
+    --email "mmeo44244@gmail.com"
+```
+
+Kết quả mong đợi:
+
+```json
+{
+  "ok": true,
+  "cookies_seeded": 15,
+  "cookies_live": 15,
+  "signed_in": true,
+  "pool_file": "...\\pools\\windows.json"
+}
+```
+
+`signed_in: true` nghĩa là browser đã đăng nhập thật (trang Gemini hiện
+"Thư viện", "Đã lên lịch", lịch sử chat).
+
+**Bước 2 — sync (mỗi lần cần cookie mới):**
+
+```powershell
+python -m orchestrator.orch_cli cookie sync --account mmeo
+```
+
+> `--pool` là **optional** — orchestrator tự map account → pool
+> (`mmeo` → `windows`, `catkingmv` → `wsl`). Chỉ cần chỉ định khi dùng
+> account mới chưa có trong mapping.
+
+Hoặc từ agent qua MCP:
+
+```
+orch_cookie_sync(action="sync", account="mmeo")
+```
+
+### 3.3. Vì sao các cách "hiển nhiên" không dùng được (đã verify thật)
+
+| Cách | Kết quả thực nghiệm |
+|---|---|
+| Đọc `Network/Cookies` ngoài tiến trình | Không giải mã được (app-bound `v20`) |
+| **Copy** profile sang user-data-dir khác | Chrome **xoá cookie** (65 → 0): Device Bound Session không khớp |
+| `--remote-debugging-port` với user-data-dir default | Chrome ≥136 **từ chối** (không mở port) |
+| `--remote-debugging-port` + **short path 8.3** (`USERDA~1`) | Port mở được, nhưng cookie vẫn không giải mã (Chrome so sánh path đã resolve) |
+| `--remote-debugging-pipe` | Trên Windows cần handle riêng, `stdin` không dùng được |
+| **Chrome riêng + cấy cookie qua CDP** | ✅ **Thành công** |
+
+Nguyên tắc rút ra: Google bind session (Device Bound Session) vào *đúng
+user-data-dir nơi nó được tạo*. Nên phải **làm việc trong chính Chrome đó**,
+đừng copy đi.
+
+### 3.4. ⚠️ Đóng Chrome đúng cách
+
+Chrome chỉ ghi session cookie vào DB khi thoát **graceful**. Nếu kill cứng
+(`terminate()`), cookie biến mất và lần sau phải `adopt` lại.
+
+Module `cookie_sync` luôn đóng bằng CDP `Browser.close` → thoát mã `0` →
+cookie được flush. Nếu bạn tự kill Chrome của orchestrator, hãy chạy lại
+`sync` (cookie vẫn còn trong phiên nếu Chrome chưa đóng) hoặc `adopt`.
+
+> Khi dùng `login`, bạn đóng Chrome bằng cửa sổ → Chrome thoát graceful →
+> cookie được flush → `sync` đọc được. Đừng kill cứng từ Task Manager.
+
+### 3.5. Bảng tóm tắt
+
+| Lệnh | Khi nào | Cần extension? |
+|---|---|---|
+| `cookie_sync login --account X` | Account mới, chưa từng có cookie | ❌ |
+| `cookie_sync adopt --account X --export f.json` | Đã có file export Cookie-Editor | ✅ (1 lần) |
+| `cookie_sync sync --account X` | Mỗi lần cần cookie mới | ❌ |
+| `cookie_sync status --account X` | Kiểm tra trạng thái | ❌ |
+
+Mapping account → pool tự động (`orchestrator/cookie_sync.py`, `ACCOUNT_POOLS`):
+`mmeo` → `windows`, `catkingmv` → `wsl`. Cần account mới thì thêm vào dict
+này (hoặc truyền `--pool`).
+
+---
+
 ## 4. ⚠️ Rủi ro "Evil Clone" — ĐỌC TRƯỚC KHI CHẠY
 
 Google nhận diện session trùng lặp. Nếu bạn **vừa copy cookie từ profile đang mở** rồi chạy `gemini_webapi` cùng lúc, Google có thể:

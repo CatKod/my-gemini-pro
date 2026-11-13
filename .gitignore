@@ -12,6 +12,11 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Build artifacts (PyInstaller)
+build/
+dist/
+*.spec.bak
+
 # Editor / OS
 .vscode/
 .idea/
