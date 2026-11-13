@@ -7,6 +7,29 @@
 **Trạng thái:** nghiên cứu xong, chưa viết code production.
 **Người dùng:** `CatKod` (GitHub), máy Windows 11 + WSL2 Ubuntu.
 
+**Repo GitHub:** <https://github.com/CatKod/my-gemini-pro>
+**Path local:** `D:\GitHub\my-gemini-pro`
+**agentmemory:** project `my-gemini-pro`, agentId `cursor` — đã lưu quyết định kiến trúc
+(`mem_mwf0c8c7_ffaa356cfa93`).
+
+---
+
+## 0. Cách resume phiên mới (đọc trước, 30 giây)
+
+1. Mở `D:\GitHub\my-gemini-pro` trong Cursor
+2. Rule `.cursor/rules/gemini-pro.mdc` tự load (có `alwaysApply: true`)
+3. Chạy:
+   ```powershell
+   python scripts\continue.py
+   ```
+   → in ra: repo path, trạng thái env (`gemini_webapi`, `mcp`, `gemini_mcp.py`), danh sách pool,
+     và **bước tiếp theo cụ thể** (READY hay BLOCKED + hướng dẫn).
+4. Đọc `docs/HANDOFF.md` (file này) để có đầy đủ context.
+5. Nếu cần context đã lưu:
+   ```powershell
+   agentmemory search "gemini deep research" --project my-gemini-pro
+   ```
+
 ---
 
 ## 1. Bối cảnh: vì sao dự án này tồn tại
