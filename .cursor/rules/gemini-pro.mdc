@@ -1,3 +1,9 @@
+---
+description: Quy tắc cho dự án my-gemini-pro — điều khiển Gemini Deep Research qua gemini_webapi. Khi user nhắn "continue", đọc docs/HANDOFF.md trước.
+globs: ["**/*.py", "**/*.md", "**/*.mdc"]
+alwaysApply: true
+---
+
 # Rule cho phiên mới trong repo my-gemini-pro
 
 **Mục tiêu dự án:** điều khiển Gemini Deep Research trên `gemini.google.com` bằng cookie của
@@ -15,8 +21,8 @@ docs/ARCHITECTURE.md ← thiết kế hệ thống
 docs/COOKIE-SETUP.md ← cách lấy cookie
 ```
 
-Khi user nhắn `continue`, đọc `docs/HANDOFF.md` trước, rồi báo lại trạng thái hiện tại
-và hỏi bước tiếp theo nếu còn blocker.
+Khi user nhắn `continue`, đọc `docs/HANDOFF.md` trước, chạy `python scripts/continue.py`,
+rồi báo lại trạng thái hiện tại và hỏi bước tiếp theo nếu còn blocker.
 
 ---
 
