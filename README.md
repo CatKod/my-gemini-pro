@@ -31,12 +31,13 @@ my-gemini-pro/
 │   └── COOKIE-SETUP.md
 ├── tools/
 │   ├── gemini_dr_mcp.py        ← MCP server Deep Research (chưa viết)
-│   └── gemini_pool.py          ← pool config + auto-select
+│   └── gemini_pool.py          ← pool config + auto-select (chưa viết)
 ├── scripts/
-│   ├── scan_browser_cookies.py ← công cụ quét cookie (đã dùng để nghiên cứu)
-│   └── setup_pool.py           ← tạo pool từ cookie export
+│   ├── continue.py             ← entrypoint cho phiên mới (nhắn "continue")
+│   ├── scan_browser_cookies.py ← quét trạng thái cookie trên máy
+│   └── setup_pool.py           ← tạo/validate/probe pool
 ├── research/
-│   └── chatcmd-analysis.md     ← phân tích int04/ChatCmd
+│   └── chatcmd-analysis.md     ← phân tích int04/ChatCmd (đã loại)
 ├── pools/                      ← cookie export (gitignore, KHÔNG commit)
 └── .cursor/rules/
     └── gemini-pro.mdc          ← rule tự động cho phiên mới
@@ -45,12 +46,31 @@ my-gemini-pro/
 ## Bắt đầu nhanh
 
 ```powershell
-# 1. Đọc bàn giao
-Get-Content docs\HANDOFF.md
+# 0. Phiên mới: xem trạng thái hiện tại
+python scripts\continue.py
 
-# 2. Quét lại trạng thái cookie
+# 1. Quét trạng thái cookie hiện tại
 python scripts\scan_browser_cookies.py
+
+# 2. Sau khi export cookie (Cookie-Editor):
+python scripts\setup_pool.py setup --export <file.json> --name windows --account mmeo44244@gmail.com
+python scripts\setup_pool.py validate
+python scripts\setup_pool.py probe
+
+# 3. Test một deep research thật
+python -c "import asyncio; from gemini_webapi import GeminiClient; ..."
 ```
+
+## Về "nhắn continue ở phiên khác"
+
+Repo được thiết kế để phiên mới nạp lại context chỉ bằng 1 từ khoá:
+
+1. **`docs/HANDOFF.md`** — toàn bộ context, bằng chứng, kế hoạch, việc chưa làm
+2. **`.cursor/rules/gemini-pro.mdc`** — rule tự động: đọc HANDOFF.md trước, không dùng AI Studio API, không đọc cookie ngoài Chrome, không commit cookie
+3. **`scripts/continue.py`** — in trạng thái hiện tại + bước tiếp theo
+4. **agentmemory** — đã lưu quyết định kiến trúc (project `my-gemini-pro`, agent `cursor`)
+
+Mở repo này trong Cursor → nhắn `continue` → agent sẽ đọc rule, đọc HANDOFF.md, chạy `scripts/continue.py` và báo đúng trạng thái.
 
 ## Rủi ro đã biết
 
