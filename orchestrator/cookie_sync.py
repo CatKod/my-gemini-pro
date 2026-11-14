@@ -84,6 +84,16 @@ POOLS_DIR = _resolve_pools_dir()
 REQUIRED = "__Secure-1PSID"
 OPTIONAL = "__Secure-1PSIDTS"
 
+#: `account_status` hợp lệ (session dùng được) — xem `gemini_webapi.constants.
+#: AccountStatus`. `AVAILABLE` (1000) là trạng thái **thành công**; các giá trị
+#: khác nghĩa là session bị chặn / hết hạn / chưa xác thực.
+_OK_ACCOUNT_STATUSES = frozenset(
+    {
+        "AVAILABLE",
+        "ACTIVE",  # tương thích ngược
+    }
+)
+
 #: Các cookie cần cho phiên Gemini. Nhiều hơn thì càng tốt cho adopt.
 SESSION_COOKIES = (
     REQUIRED,
@@ -314,6 +324,61 @@ class ChromeSession:
             marker.unlink(missing_ok=True)
             return None
 
+    def _kill_stale_instances(self) -> int:
+        """Giết Chrome cũ đang giữ user-data-dir này.
+
+        Chrome cho phép **một** tiến trình duy nhất dùng 1 user-data-dir. Nếu
+        còn instance cũ (do lần chạy trước bị kill cứng khi exception), Chrome
+        mới sẽ nhận lệnh "mở tab trong instance cũ" rồi thoát → cổng debug
+        không bao giờ mở → `CDPError: Chrome không mở cổng debug`.
+
+        Chỉ kill tiến trình Chrome **của orchestrator** (đúng user-data-dir),
+        không đụng Chrome cá nhân của user.
+        """
+        target = str(self.user_data_dir).lower()
+        killed = 0
+
+        try:
+            import subprocess as _sp
+
+            # Dùng PowerShell + CIM để lấy CommandLine (wmic đã bị bỏ).
+            # `-like` dùng wildcard, nên backslash KHÔNG cần escape.
+            script = (
+                "$t = '" + target.replace("'", "''") + "';"
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                "Where-Object { "
+                "  $_.CommandLine -and "
+                "  $_.CommandLine.ToLower().Contains($t) -and "
+                "  $_.CommandLine -notlike '*--type=*' "
+                "} | ForEach-Object { "
+                "  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; "
+                "  $_.ProcessId "
+                "}"
+            )
+            out = _sp.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            killed = len([ln for ln in (out.stdout or "").splitlines() if ln.strip()])
+        except Exception:
+            killed = 0
+
+        if killed:
+            # Đợi Chrome giải phóng user-data-dir.
+            import time as _time
+
+            _time.sleep(2.5)
+
+        return killed
+
     def start(self) -> None:
         from orchestrator import cdp
 
@@ -336,6 +401,11 @@ class ChromeSession:
                     self._owns_browser = False
                     return
 
+        # Chrome không cho 2 tiến trình dùng chung 1 user-data-dir: nếu còn
+        # instance cũ (do lần chạy trước bị kill cứng), Chrome mới sẽ thoát
+        # ngay và không mở cổng debug. → Dọn instance cũ rồi thử lại.
+        self._kill_stale_instances()
+
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
             str(exe),
@@ -352,12 +422,37 @@ class ChromeSession:
         )
         self._owns_browser = True
         self._cdp = cdp.CDPClient(self.port)
-        self._cdp.wait_until_ready()
-        self._cdp.connect()
+        try:
+            self._cdp.wait_until_ready()
+            self._cdp.connect()
+        except Exception:
+            # Có thể instance cũ vẫn giữ user-data-dir → thử dọn rồi spawn lại.
+            self._close_browser_process()
+            self._kill_stale_instances()
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            self._cdp = cdp.CDPClient(self.port)
+            self._cdp.wait_until_ready()
+            self._cdp.connect()
         # Ghi port để lần sau nhận ra instance đang chạy.
         (self.user_data_dir / "orch-cdp-port.txt").write_text(
             str(self.port), encoding="utf-8"
         )
+
+    def _close_browser_process(self) -> None:
+        """Đóng tiến trình Chrome ta vừa spawn (nếu còn)."""
+        if self._proc is None:
+            return
+        try:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
+        except Exception:
+            pass
+        self._proc = None
 
     # -- API ---------------------------------------------------------------
 
@@ -658,14 +753,14 @@ def _probe_session(cookies: dict[str, str]) -> dict[str, Any]:
             "warning": f"không kiểm tra được session: {type(e).__name__}: {e}",
         }
 
-    ok = status == "ACTIVE"
+    ok = status in _OK_ACCOUNT_STATUSES
     warning = None
     if not ok:
         warning = (
             f"Session KHÔNG còn hiệu lực (account_status={status}). "
             "Cookie vẫn còn nhưng Google đã hết hạn session → mọi Deep Research "
-            "sẽ fail với 'Permission denied'. Cần chạy `adopt` lại (file export "
-            "Cookie-Editor mới) hoặc `login` để đăng nhập lại trong Chrome riêng."
+            "sẽ fail với 'Permission denied'. Cần đăng nhập lại: với tài khoản "
+            "loại 2 dùng `account login` (tự động), với loại 1 dùng `cookie login`."
         )
     return {"ok": ok, "account_status": status, "warning": warning}
 

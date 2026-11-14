@@ -251,6 +251,64 @@ def cmd_cookie(args: argparse.Namespace) -> int:
     return 0 if out.get("ok", True) else 1
 
 
+def cmd_account(args: argparse.Namespace) -> int:
+    """Quản lý tài khoản Gemini (thêm / đăng nhập / kiểm tra / xoá).
+
+    Đây là **điểm vào duy nhất** để thêm tài khoản — thay vì phải nhớ cả
+    `cookie adopt` + `cookie sync` + sửa `pools/*.json` thủ công.
+    """
+    from orchestrator import accounts as account_registry
+
+    cmd = args.account_cmd
+
+    try:
+        if cmd == "add":
+            out = account_registry.add_account(
+                args.email,
+                account=args.account,
+                pool=args.pool,
+                password=args.password,
+            )
+            # Nếu có mật khẩu → tự đăng nhập luôn (tài khoản loại 2).
+            if args.password and args.auto_login:
+                from orchestrator import auto_login
+
+                login_result = auto_login.auto_login(
+                    out["account"], keep_open=not args.no_keep_open
+                )
+                out["login"] = login_result
+                out["ok"] = bool(login_result.get("ok"))
+        elif cmd == "set-password":
+            out = account_registry.set_password(args.account, args.password)
+        elif cmd == "login":
+            from orchestrator import auto_login
+
+            out = auto_login.auto_login(args.account)
+        elif cmd == "list":
+            out = account_registry.list_accounts()
+        elif cmd == "show":
+            out = account_registry.get(args.account) or {
+                "error": f"không tìm thấy account {args.account!r}"
+            }
+        elif cmd == "remove":
+            out = {
+                "ok": account_registry.remove(
+                    args.account, delete_pool=args.delete_pool
+                ),
+                "account": args.account,
+            }
+        else:  # pragma: no cover - argparse chặn trước
+            out = {"error": f"lệnh không hợp lệ: {cmd}"}
+    except Exception as e:
+        _print({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        return 1
+
+    _print(out)
+    if isinstance(out, dict):
+        return 0 if out.get("ok", True) else 1
+    return 0
+
+
 def cmd_runner(args: argparse.Namespace) -> int:
     """Chạy runner trong tiến trình hiện tại (lệnh nội bộ).
 
@@ -355,6 +413,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Lệnh nội bộ: dùng để spawn runner khi chạy từ `.exe` đã đóng gói.
     # Khi frozen, `sys.executable` chính là file .exe — không thể dùng
+    p = sub.add_parser(
+        "account",
+        help="Quản lý tài khoản Gemini (add / login / list / remove)",
+    )
+    p.add_argument(
+        "account_cmd",
+        choices=["add", "set-password", "login", "list", "show", "remove"],
+    )
+    p.add_argument("--email", default=None, help="email tài khoản Google")
+    p.add_argument("--account", default=None, help="tên account (mặc định: suy từ email)")
+    p.add_argument("--pool", default=None, help="tên pool trong pools/")
+    p.add_argument(
+        "--password",
+        default=None,
+        help="mật khẩu (lưu mã hoá DPAPI; truyền trực tiếp để tránh lưu)",
+    )
+    p.add_argument(
+        "--no-auto-login",
+        dest="auto_login",
+        action="store_false",
+        help="không tự đăng nhập sau khi thêm account",
+    )
+    p.add_argument(
+        "--no-keep-open",
+        dest="no_keep_open",
+        action="store_true",
+        help="đóng Chrome sau khi đăng nhập (mặc định giữ mở để xử lý tay)",
+    )
+    p.add_argument(
+        "--delete-pool",
+        action="store_true",
+        help="xoá luôn file pool khi remove account",
+    )
+    p.set_defaults(func=cmd_account, auto_login=True)
+
     # `python -m orchestrator.runners.<x>` nữa. Thay vào đó ta gọi lại chính
     # executable với lệnh này.
     p = sub.add_parser("__runner__", help=argparse.SUPPRESS)

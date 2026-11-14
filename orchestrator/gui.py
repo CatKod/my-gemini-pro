@@ -325,22 +325,30 @@ class OrchestratorGUI:
 
 
 class AccountsWindow:
-    """Cửa sổ quản lý tài khoản Gemini.
+    """Cửa sổ quản lý tài khoản Gemini — **dùng account registry làm nguồn sự thật**.
 
-    Cho phép:
-      - Thêm account mới (tên + email + pool) → tạo pool rỗng sẵn sàng.
-      - **Đăng nhập**: mở Chrome riêng để user đăng nhập Google (1 lần).
-      - **Nhập cookie từ file**: dùng file Cookie-Editor export (JSON).
-      - **Đồng bộ**: lấy cookie live từ Chrome riêng → ghi pool.
-      - Xem trạng thái: cookie trong DB, pool, session còn hiệu lực không.
+    Vì sao làm lại
+    -------------
+    Cơ chế cũ có 3 nguồn trạng thái rời rạc (pool file, mapping account→pool,
+    credential) nên thêm account phải làm nhiều thao tác và dễ sót. Giờ **1
+    lệnh `account add`** làm hết: tạo entry, tạo pool rỗng, lưu mật khẩu (DPAPI),
+    và tự đăng nhập nếu là tài khoản loại 2.
+
+    2 loại tài khoản
+    ----------------
+    - **Loại 1 — có xác thực (2FA)**: bấm "Đăng nhập tay (Chrome)" → user đăng
+      nhập tay 1 lần → cookie sync tự động mãi.
+    - **Loại 2 — chỉ email + password**: nhập email + mật khẩu → bấm "Thêm &
+      đăng nhập" → orchestrator tự điền form. Gặp CAPTCHA/2FA thì dừng lại để
+      user xử lý tay (không bypass).
     """
 
     def __init__(self, parent: tk.Misc, app: OrchestratorGUI) -> None:
         self.app = app
         self.win = tk.Toplevel(parent)
         self.win.title("Tài khoản Gemini")
-        self.win.geometry("920x560")
-        self.win.minsize(760, 460)
+        self.win.geometry("980x640")
+        self.win.minsize(820, 540)
 
         self._build()
         self._refresh()
@@ -356,15 +364,17 @@ class AccountsWindow:
         ttk.Button(top, text="Làm mới", command=self._refresh).pack(side="right", padx=4)
 
         # Bảng tài khoản
-        cols = ("account", "pool", "email", "profile", "db", "pool_state")
-        self.tree = ttk.Treeview(self.win, columns=cols, show="headings", selectmode="browse")
+        cols = ("account", "pool", "email", "auth", "session", "last")
+        self.tree = ttk.Treeview(
+            self.win, columns=cols, show="headings", selectmode="browse"
+        )
         heads = {
             "account": ("Account", 130),
             "pool": ("Pool", 90),
-            "email": ("Email", 190),
-            "profile": ("Chrome riêng", 150),
-            "db": ("Cookie DB", 80),
-            "pool_state": ("Trạng thái pool", 260),
+            "email": ("Email", 210),
+            "auth": ("Loại", 190),
+            "session": ("Session", 200),
+            "last": ("Cập nhật lần cuối", 170),
         }
         for c, (h, w) in heads.items():
             self.tree.heading(c, text=h)
@@ -376,35 +386,55 @@ class AccountsWindow:
         form = ttk.LabelFrame(self.win, text="Thêm tài khoản mới", padding=8)
         form.pack(fill="x", padx=10, pady=(0, 8))
 
-        ttk.Label(form, text="Tên account:").grid(row=0, column=0, sticky="w")
-        self.entry_account = ttk.Entry(form, width=18)
-        self.entry_account.grid(row=0, column=1, sticky="w", padx=(4, 12))
-
-        ttk.Label(form, text="Pool:").grid(row=0, column=2, sticky="w")
-        self.entry_pool = ttk.Entry(form, width=14)
-        self.entry_pool.grid(row=0, column=3, sticky="w", padx=(4, 12))
-
-        ttk.Label(form, text="Email:").grid(row=0, column=4, sticky="w")
+        ttk.Label(form, text="Email:").grid(row=0, column=0, sticky="w")
         self.entry_email = ttk.Entry(form, width=26)
-        self.entry_email.grid(row=0, column=5, sticky="w", padx=(4, 4))
+        self.entry_email.grid(row=0, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Button(form, text="Thêm", command=self._add_account).grid(
+        ttk.Label(form, text="Tên account:").grid(row=0, column=2, sticky="w")
+        self.entry_account = ttk.Entry(form, width=16)
+        self.entry_account.grid(row=0, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(form, text="Pool:").grid(row=0, column=4, sticky="w")
+        self.entry_pool = ttk.Entry(form, width=12)
+        self.entry_pool.grid(row=0, column=5, sticky="w", padx=(4, 4))
+
+        ttk.Button(form, text="Thêm & đăng nhập", command=self._add_account).grid(
             row=0, column=6, padx=(6, 0)
         )
 
+        # Form mật khẩu (loại 2)
+        form2 = ttk.LabelFrame(
+            self.win,
+            text="Mật khẩu (tài khoản loại 2 — chỉ cần email + mật khẩu)",
+            padding=8,
+        )
+        form2.pack(fill="x", padx=10, pady=(0, 8))
+
+        ttk.Label(form2, text="Account:").grid(row=0, column=0, sticky="w")
+        self.entry_pw_account = ttk.Entry(form2, width=16)
+        self.entry_pw_account.grid(row=0, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(form2, text="Mật khẩu:").grid(row=0, column=2, sticky="w")
+        self.entry_password = ttk.Entry(form2, width=26, show="*")
+        self.entry_password.grid(row=0, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Button(form2, text="Lưu & đăng nhập", command=self._do_auto_login).grid(
+            row=0, column=4, padx=(6, 0)
+        )
+
         ttk.Label(
-            form,
+            form2,
             text=(
-                "Tên account = tên thư mục Chrome riêng (%LOCALAPPDATA%\\OrchestratorChrome\\<tên>). "
-                "Pool = tên file trong pools/ (mặc định windows/wsl)."
+                "Mật khẩu được mã hoá bằng DPAPI của Windows (chỉ user này, trên máy này "
+                "giải mã được). Không bao giờ ghi plaintext."
             ),
             foreground="#555555",
-        ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
         # Hành động
         btns = ttk.Frame(self.win, padding=(10, 0, 10, 8))
         btns.pack(fill="x")
-        ttk.Button(btns, text="Đăng nhập (Chrome)", command=self._do_login).pack(
+        ttk.Button(btns, text="Đăng nhập tay (Chrome)", command=self._do_login).pack(
             side="left", padx=(0, 6)
         )
         ttk.Button(btns, text="Nhập cookie (file)", command=self._do_adopt).pack(
@@ -416,7 +446,7 @@ class AccountsWindow:
         ttk.Button(btns, text="Kiểm tra session", command=self._do_check).pack(
             side="left", padx=(0, 6)
         )
-        ttk.Button(btns, text="Xoá pool", command=self._do_delete_pool).pack(
+        ttk.Button(btns, text="Xoá tài khoản", command=self._do_remove).pack(
             side="left", padx=(0, 6)
         )
 
@@ -441,6 +471,12 @@ class AccountsWindow:
         acc = self._selected_account()
         if not acc:
             return
+        # Điền sẵn account vào form mật khẩu để tiện.
+        try:
+            self.entry_pw_account.delete(0, "end")
+            self.entry_pw_account.insert(0, acc)
+        except tk.TclError:
+            pass
         self.status.config(text=f"Đang chọn: {acc}")
 
     def _run_bg(self, fn, done) -> None:
@@ -459,13 +495,16 @@ class AccountsWindow:
     # -- Actions -------------------------------------------------------
 
     def _refresh(self) -> None:
+        from orchestrator import accounts as account_registry
         from orchestrator import cookie_sync
 
         rows: list[tuple[str, str, str, str, str, str]] = []
-        names = set(cookie_sync.ACCOUNT_POOLS.keys())
 
-        # Account đã khai báo trong pools/ (có "profile" = tên account).
-        pool_states: dict[str, str] = {}
+        # 1. Account trong registry (nguồn sự thật).
+        registry = {a["account"]: a for a in account_registry.list_accounts()}
+
+        # 2. Pool file có cookie nhưng chưa khai báo trong registry → hiện luôn
+        #    để user không bỏ sót (trạng thái legacy).
         for pf in sorted(cookie_sync.POOLS_DIR.glob("*.json")):
             if pf.name in ("example.json", cookie_sync.ACCOUNT_POOLS_FILE):
                 continue
@@ -474,29 +513,51 @@ class AccountsWindow:
             except (OSError, ValueError):
                 continue
             acc = str(data.get("profile") or pf.stem)
-            names.add(acc)
-            cookies = data.get("cookies") or []
-            pool_states[acc] = (
-                f"{pf.name} — {len(cookies)} cookie"
-                + (f" — {data.get('account_email')}" if data.get("account_email") else "")
-            )
+            if acc not in registry:
+                registry[acc] = {
+                    "account": acc,
+                    "email": data.get("account_email") or "",
+                    "pool": pf.stem,
+                    "auth": "oauth",
+                    "has_password": False,
+                    "last_ok_at": None,
+                    "last_error": None,
+                }
 
-        for acc in sorted(names):
-            pool = cookie_sync.default_pool_for(acc)
-            st = cookie_sync.status(acc, pool_name=pool)
-            db = (
-                "n/a"
-                if st.get("cookies_in_db", 0) < 0
-                else f"{st.get('cookies_in_db', 0)} cookie"
-            )
+        for acc in sorted(registry):
+            info = registry[acc]
+            pool = info.get("pool") or acc
+
+            # Trạng thái pool: có cookie hay không.
+            pool_file = cookie_sync.POOLS_DIR / f"{pool}.json"
+            n_cookies = 0
+            if pool_file.is_file():
+                try:
+                    pdata = json.loads(pool_file.read_text(encoding="utf-8"))
+                    n_cookies = len(pdata.get("cookies") or [])
+                except (OSError, ValueError):
+                    n_cookies = 0
+
+            if info.get("last_error"):
+                session = f"LỖI: {str(info['last_error'])[:80]}"
+            elif n_cookies:
+                session = f"có cookie ({n_cookies})"
+            else:
+                session = "chưa có cookie"
+
+            auth = {
+                "password": "loại 2 (email+mật khẩu)",
+                "oauth": "loại 1 (đăng nhập tay)",
+            }.get(str(info.get("auth")), str(info.get("auth") or ""))
+
             rows.append(
                 (
                     acc,
                     pool,
-                    st.get("account_email") or "",
-                    st.get("user_data_dir") or "",
-                    db,
-                    pool_states.get(acc, "chưa có pool"),
+                    info.get("email") or "",
+                    auth,
+                    session,
+                    info.get("last_ok_at") or info.get("last_error_at") or "-",
                 )
             )
 
@@ -507,44 +568,84 @@ class AccountsWindow:
         self.status.config(text=f"{len(rows)} tài khoản")
 
     def _add_account(self) -> None:
-        from orchestrator import cookie_sync
+        """Thêm account mới (tài khoản loại 2: có email + mật khẩu)."""
+        from orchestrator import accounts as account_registry
 
-        acc = self.entry_account.get().strip()
-        if not acc:
-            messagebox.showinfo("Thêm tài khoản", "Nhập tên account trước đã.")
+        email = self.entry_email.get().strip()
+        if not email:
+            messagebox.showinfo("Thêm tài khoản", "Nhập email trước đã.")
             return
-        pool = self.entry_pool.get().strip() or cookie_sync.default_pool_for(acc)
-        email = self.entry_email.get().strip() or None
+        acc = self.entry_account.get().strip() or None
+        pool = self.entry_pool.get().strip() or None
+        password = self.entry_password.get().strip() or None
 
-        pool_file = cookie_sync.POOLS_DIR / f"{pool}.json"
-        if pool_file.is_file():
+        if not password:
             if not messagebox.askyesno(
-                "Pool đã tồn tại",
-                f"Pool {pool!r} đã có cookie. Ghi đè?",
+                "Thiếu mật khẩu",
+                "Không nhập mật khẩu -> đây là tài khoản LOẠI 1.\n"
+                "Bạn sẽ phải đăng nhập tay trong cửa sổ Chrome.\n\n"
+                "Vẫn muốn tiếp tục?",
             ):
                 return
-        payload = {
-            "name": pool,
-            "account_email": email,
-            "browser": "chrome",
-            "profile": acc,
-            "source": "orchestrator-gui",
-            "cookies": [],
-        }
-        cookie_sync._write_json_atomic(pool_file, payload)
 
-        # Ghi nhớ mapping account → pool cho các lần sau.
-        cookie_sync.set_account_pool(acc, pool)
+        try:
+            out = account_registry.add_account(
+                email, account=acc, pool=pool, password=password
+            )
+        except Exception as e:
+            messagebox.showerror("Thêm tài khoản", f"{type(e).__name__}: {e}")
+            return
 
+        acc_name = out["account"]
+        self.entry_email.delete(0, "end")
         self.entry_account.delete(0, "end")
         self.entry_pool.delete(0, "end")
-        self.entry_email.delete(0, "end")
-        self._refresh()
-        messagebox.showinfo(
-            "Thêm tài khoản",
-            f"Đã thêm account {acc!r} → pool {pool!r}.\n\n"
-            "Bước tiếp theo: bấm 'Đăng nhập (Chrome)' để đăng nhập Google, "
-            "hoặc 'Nhập cookie (file)' nếu bạn đã export từ Cookie-Editor.",
+        self.entry_password.delete(0, "end")
+
+        if not password:
+            self._refresh()
+            messagebox.showinfo(
+                "Thêm tài khoản",
+                f"Đã thêm account {acc_name!r} (loại 1).\n\n"
+                "Bước tiếp theo: bấm 'Đăng nhập tay (Chrome)' và đăng nhập Google "
+                "một lần. Sau đó cookie được đồng bộ tự động.",
+            )
+            return
+
+        # Có mật khẩu -> tự đăng nhập.
+        self.status.config(text=f"Đang đăng nhập {acc_name}...")
+        from orchestrator import auto_login
+
+        self._run_bg(
+            lambda: auto_login.auto_login(acc_name),
+            lambda res: self._after_login(res, acc_name),
+        )
+
+    def _do_auto_login(self) -> None:
+        """Lưu mật khẩu (DPAPI) rồi đăng nhập tự động cho account đã chọn."""
+        from orchestrator import accounts as account_registry
+        from orchestrator import auto_login
+
+        acc = self.entry_pw_account.get().strip() or self._selected_account()
+        if not acc:
+            messagebox.showinfo("Đăng nhập", "Chọn một tài khoản trước đã.")
+            return
+        password = self.entry_password.get().strip()
+        if not password:
+            messagebox.showinfo("Đăng nhập", "Nhập mật khẩu trước đã.")
+            return
+
+        try:
+            account_registry.set_password(acc, password)
+        except Exception as e:
+            messagebox.showerror("Lưu mật khẩu", f"{type(e).__name__}: {e}")
+            return
+
+        self.entry_password.delete(0, "end")
+        self.status.config(text=f"Đang đăng nhập {acc}...")
+        self._run_bg(
+            lambda: auto_login.auto_login(acc),
+            lambda res: self._after_login(res, acc),
         )
 
     def _do_login(self) -> None:
@@ -626,24 +727,62 @@ class AccountsWindow:
             lambda out: self._after_action(out, "Kết quả kiểm tra session"),
         )
 
-    def _do_delete_pool(self) -> None:
-        from orchestrator import cookie_sync
+    def _do_remove(self) -> None:
+        """Xoá account khỏi registry (và tuỳ chọn xoá pool + credential)."""
+        from orchestrator import accounts as account_registry
 
         acc = self._selected_account()
         if not acc:
             messagebox.showinfo("Xoá", "Chọn một tài khoản trước đã.")
             return
-        pool = self._selected_pool() or cookie_sync.default_pool_for(acc)
-        pool_file = cookie_sync.POOLS_DIR / f"{pool}.json"
-        if not pool_file.is_file():
-            messagebox.showinfo("Xoá", f"Pool {pool!r} không có file.")
-            return
         if not messagebox.askyesno(
-            "Xoá pool", f"Xoá file pool {pool_file.name}?\nCookie sẽ phải nhập lại."
+            "Xoá tài khoản",
+            f"Xoá account {acc!r} khỏi registry?\n\n"
+            "Mật khẩu đã lưu cũng bị xoá.\n"
+            "Cookie trong pool KHÔNG bị xoá (chọn Yes ở câu hỏi sau nếu muốn).",
         ):
             return
-        pool_file.unlink(missing_ok=True)
+        delete_pool = messagebox.askyesno(
+            "Xoá pool", f"Xoá luôn file pool của {acc!r}? (cookie sẽ mất)"
+        )
+        ok = account_registry.remove(acc, delete_pool=delete_pool)
         self._refresh()
+        messagebox.showinfo(
+            "Xoá tài khoản",
+            "Đã xoá." if ok else "Không tìm thấy account để xoá.",
+        )
+
+    def _after_login(self, out: dict, acc: str) -> None:
+        """Hiển thị kết quả đăng nhập tự động, xử lý các state đặc biệt."""
+        self._refresh()
+        state = out.get("state")
+
+        if state == "needs_human":
+            messagebox.showwarning(
+                "Cần bạn xử lý",
+                f"{out.get('reason')}\n\n{out.get('hint', '')}\n\n"
+                "Sau khi xử lý xong: bấm 'Đồng bộ cookie'.",
+            )
+        elif state == "blocked":
+            messagebox.showerror(
+                "Google chặn đăng nhập",
+                f"{out.get('reason')}\n\n{out.get('hint', '')}",
+            )
+        elif out.get("ok"):
+            msg = f"Đăng nhập thành công cho {acc}."
+            if out.get("account_status"):
+                msg += f"\ntrạng thái: {out['account_status']}"
+            if out.get("cookies"):
+                msg += f"\ncookie: {out['cookies']}"
+            if out.get("detail"):
+                msg += f"\n\n! {out['detail']}"
+            messagebox.showinfo("Đăng nhập", msg)
+        else:
+            messagebox.showerror(
+                "Đăng nhập thất bại",
+                out.get("reason") or out.get("error") or "Không rõ nguyên nhân",
+            )
+        self.status.config(text="Xong")
 
     def _after_action(self, out: dict, title: str) -> None:
         """Hiển thị kết quả sau khi hành động xong."""
@@ -665,7 +804,7 @@ class AccountsWindow:
             if out.get("next_step"):
                 msg += f"\n\n{out['next_step']}"
             if out.get("warning"):
-                messagebox.showwarning(title, msg + f"\n\n⚠ {out['warning']}")
+                messagebox.showwarning(title, msg + f"\n\n! {out['warning']}")
             else:
                 messagebox.showinfo(title, msg)
         else:

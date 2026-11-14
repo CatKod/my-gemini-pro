@@ -532,3 +532,84 @@ Orchestrator sở hữu **Chrome riêng** tại `%LOCALAPPDATA%\OrchestratorChro
   `sync` giờ probe session thật và cảnh báo rõ ràng.
 - `python -m orchestrator.selftest` → `SELFTEST PASS` sau khi sửa mapping.
 
+
+---
+
+## 12. ⭐⭐ Thiết kế lại toàn bộ cơ chế tài khoản & cookie (2026-11-14)
+
+**Yêu cầu của user:** 2 loại tài khoản — (1) có xác thực, (2) chỉ email + mật
+khẩu; loại 2 sẽ là loại chủ yếu. Cơ chế "thêm tài khoản" cũ không ổn → làm lại.
+
+**Thiết kế chi tiết: `docs/ACCOUNT-MANAGEMENT.md`** (đọc file đó).
+
+### Kết luận nghiên cứu (đã verify thực nghiệm, không đoán)
+
+**OAuth HTTP flow để lấy cookie phiên web → BẤT KHẢ THI.** Đã chạy thật với
+`curl_cffi` (impersonate `chrome124`): `accounts.google.com/o/oauth2/v2/auth` trả
+`302` về `v3/signin/identifier`, cookie jar chỉ có `__Host-GAPS`. Lý do: Google
+không hỗ trợ ROPC, Botguard + reCAPTCHA Enterprise chặn HTTP login thô, bearer
+token `ya29...` không dùng được cho `gemini.google.com`, `__Secure-1PSIDTS`
+không sinh trong OAuth flow, và App-Bound Encryption (Chrome ≥127) chặn đọc
+cookie ngoài tiến trình.
+
+→ **Chrome + CDP là đường đúng**, không phải lựa chọn vì "dễ làm".
+
+### Files mới
+
+| File | Vai trò |
+|---|---|
+| `orchestrator/accounts.py` | Registry tài khoản — **nguồn sự thật duy nhất** (`pools/accounts.json`) |
+| `orchestrator/credentials.py` | Kho mật khẩu, mã hoá **Windows DPAPI** (không thêm dependency) |
+| `orchestrator/auto_login.py` | Đăng nhập Google **tự động** bằng email + mật khẩu |
+| `orchestrator/cdp.py` | + primitives điền form (`type_text_human`, `click_at`, `rect_center`, `press_enter`) |
+
+### 2 loại tài khoản
+
+| | Loại 1 (có xác thực) | Loại 2 (email + mật khẩu) |
+|---|---|---|
+| `auth` | `oauth` | `password` |
+| Đăng nhập | user tay 1 lần trong Chrome riêng | orchestrator tự điền form |
+| Session chết | user đăng nhập tay lại | `account login` — không cần user |
+
+### CLI
+
+```powershell
+python -m orchestrator.orch_cli account add --email u@gmail.com --account acc3 --pool acc3 --password "..."
+python -m orchestrator.orch_cli account login --account acc3
+python -m orchestrator.orch_cli account set-password --account acc3 --password "..."
+python -m orchestrator.orch_cli account list
+python -m orchestrator.orch_cli account remove --account acc3 --delete-pool
+```
+
+### Bẫy đã gặp (đều đã sửa + verify)
+
+| Bẫy | Sửa |
+|---|---|
+| `img#captchaimg` + `input[name=ca]` **luôn có sẵn trong DOM** (ẩn) → false-positive CAPTCHA | Phải kiểm tra **hiển thị** (`offsetParent` / bounding box) |
+| URL bước nhập mật khẩu cũng là `/signin/challenge/pwd` — **không** phải 2FA | Regex `/\/signin\/challenge\/(?!pwd\b)/` |
+| `aria-live="assertive"` chứa cả heading ("Welcome") → báo nhầm "Google báo: Welcome" | Lọc heading + text ngôn ngữ |
+| `account_status` thành công là **`AVAILABLE` (1000)**, không phải `ACTIVE` | `_OK_ACCOUNT_STATUSES = {AVAILABLE, ACTIVE}` |
+| `open_page` chỉ tạo tab `about:blank` → phải `Page.navigate` riêng | Đã sửa |
+| Chrome cũ giữ user-data-dir → Chrome mới thoát ngay, cổng debug không mở | `ChromeSession._kill_stale_instances()` + retry spawn |
+| Chờ `PASSWORD_READY` **trước** khi điền email → deadlock | Chờ ô **email** xuất hiện trước, rồi mới điền |
+| Gán `.value` bằng JS → event `isTrusted: false` → Botguard flag | `DOM.focus` + `Input.insertText` **từng ký tự** + jitter 40-120 ms |
+
+### Đã verify (2026-11-14)
+
+- **DPAPI**: round-trip encrypt/decrypt OK; ciphertext của account A không giải mã
+  được cho account B (entropy ràng buộc theo account).
+- **Registry**: add / list / show / remove OK.
+- **Auto-login end-to-end** (account thật, mật khẩu thật): điền email → tới
+  `/signin/challenge/pwd` → điền password → **21 cookie** trong profile →
+  `pools/acc3.json` có cookie → `_probe_session` → `account_status=AVAILABLE`,
+  `session_ok=true`.
+- **Chat**: `gemini-flash-lite` → `PING_OK`.
+- **Deep Research**: `create_deep_research_plan("What is the capital of France?")`
+  → plan "Capital of France" **OK**.
+- → Tài khoản loại 2 **không cần user thao tác** và Deep Research chạy được.
+
+### Ranh giới đạo đức
+
+`auto_login` **không** bypass CAPTCHA, **không** bypass 2FA, **không** giải mã
+challenge. Gặp challenge → trả `state="needs_human"`, giữ Chrome mở, báo user
+xử lý tay.

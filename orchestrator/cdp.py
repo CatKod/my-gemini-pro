@@ -19,6 +19,7 @@ chặn (xem `cookie_sync.py`).
 from __future__ import annotations
 
 import json
+import random
 import time
 import urllib.error
 import urllib.request
@@ -182,16 +183,245 @@ class CDPClient:
         self.call("Page.enable", {}, session_id=session_id)
         self.call("Page.navigate", {"url": url}, session_id=session_id)
         time.sleep(wait_ms / 1000)
+        return self.page_text(session_id)
+
+    # -- Điền form (dùng cho đăng nhập Google tự động) --------------------
+
+    def evaluate(
+        self, session_id: str, expression: str, *, await_promise: bool = False
+    ) -> Any:
+        """Chạy JS trong trang và trả về giá trị (mặc định `returnByValue=True`)."""
         res = self.call(
             "Runtime.evaluate",
             {
-                "expression": "document.body ? document.body.innerText.slice(0, 600) : ''",
+                "expression": expression,
                 "returnByValue": True,
+                "awaitPromise": await_promise,
             },
             session_id=session_id,
         )
-        value = (res.get("result") or {}).get("value")
+        if res.get("exceptionDetails"):
+            raise CDPError(
+                f"JS lỗi: {res['exceptionDetails'].get('text')} "
+                f"{res['exceptionDetails'].get('exception', {}).get('description', '')}"
+            )
+        return (res.get("result") or {}).get("value")
+
+    def page_text(self, session_id: str, limit: int = 2000) -> str:
+        """Text hiển thị của trang (để detect trạng thái đăng nhập)."""
+        value = self.evaluate(
+            session_id,
+            f"document.body ? document.body.innerText.slice(0, {int(limit)}) : ''",
+        )
         return value if isinstance(value, str) else ""
+
+    def current_url(self, session_id: str) -> str:
+        """URL hiện tại của tab."""
+        value = self.evaluate(session_id, "location.href")
+        return value if isinstance(value, str) else ""
+
+    def wait_for(
+        self,
+        session_id: str,
+        expression: str,
+        *,
+        timeout: float = 20.0,
+        interval: float = 0.5,
+    ) -> Any:
+        """Chờ tới khi biểu thức JS trả về giá trị truthy.
+
+        Raises:
+            CDPError: hết thời gian mà biểu thức vẫn falsy.
+        """
+        deadline = time.time() + timeout
+        last: Any = None
+        while time.time() < deadline:
+            try:
+                last = self.evaluate(session_id, expression)
+            except CDPError:
+                last = None
+            if last:
+                return last
+            time.sleep(interval)
+        raise CDPError(f"wait_for timeout sau {timeout}s (biểu thức: {expression[:80]})")
+
+    def focus_selector(self, session_id: str, selector: str) -> bool:
+        """Focus element theo selector (dùng `DOM.*` để chính xác)."""
+        try:
+            doc = self.call("DOM.getDocument", {"depth": 0}, session_id=session_id)
+            root = (doc.get("root") or {}).get("nodeId")
+            if not root:
+                return False
+            res = self.call(
+                "DOM.querySelector",
+                {"nodeId": root, "selector": selector},
+                session_id=session_id,
+            )
+            node_id = res.get("nodeId")
+            if not node_id:
+                return False
+            self.call("DOM.focus", {"nodeId": node_id}, session_id=session_id)
+            return True
+        except CDPError:
+            # Fallback: focus bằng JS
+            try:
+                res = self.evaluate(
+                    session_id,
+                    f"(() => {{ const e = document.querySelector({selector!r}); "
+                    "if (!e) return false; e.focus(); return true; })()",
+                )
+                return bool(res)
+            except CDPError:
+                return False
+
+    def type_text(self, session_id: str, selector: str, text: str) -> bool:
+        """Gõ text vào ô nhập (nhanh, không jitter).
+
+        Dùng `DOM.focus` → `Input.insertText`. Gán `.value` bằng JS không đủ
+        vì React/Google đọc event `input`, mà `insertText` sinh đúng event đó.
+        """
+        if not self.focus_selector(session_id, selector):
+            return False
+        try:
+            self.call("Input.insertText", {"text": text}, session_id=session_id)
+            return True
+        except CDPError:
+            # Fallback: set value + dispatch event
+            try:
+                payload = json.dumps(text)
+                self.evaluate(
+                    session_id,
+                    f"(() => {{ const e = document.querySelector({selector!r}); "
+                    f"if (!e) return false; e.value = {payload}; "
+                    "e.dispatchEvent(new Event('input', {bubbles: true})); "
+                    "e.dispatchEvent(new Event('change', {bubbles: true})); "
+                    "return true; })()",
+                )
+                return True
+            except CDPError:
+                return False
+
+    def type_text_human(
+        self,
+        session_id: str,
+        selector: str,
+        text: str,
+        *,
+        min_delay: float = 0.04,
+        max_delay: float = 0.11,
+    ) -> bool:
+        """Gõ text **từng ký tự** kèm jitter ngẫu nhiên.
+
+        Vì sao không gõ 1 lần: Google dùng Botguard để phân tích nhịp gõ.
+        `Input.insertText` sinh event `isTrusted: true` (nên không bị flag như
+        gán `.value` bằng JS), nhưng gõ tức thời 1 lần vẫn giống bot.
+        Gõ từng ký tự với jitter 40-120 ms là mức tối thiểu để không bị đánh
+        dấu.
+
+        Vẫn **không** bypass CAPTCHA — chỉ điền form.
+        """
+        if not self.focus_selector(session_id, selector):
+            return False
+        try:
+            for ch in text:
+                self.call("Input.insertText", {"text": ch}, session_id=session_id)
+                time.sleep(random.uniform(min_delay, max_delay))
+            return True
+        except CDPError:
+            return False
+
+    def rect_center(self, session_id: str, selector: str) -> tuple[float, float] | None:
+        """Tâm của element (theo `getBoundingClientRect`), `None` nếu không có."""
+        try:
+            res = self.evaluate(
+                session_id,
+                f"(() => {{ const e = document.querySelector({selector!r}); "
+                "if (!e) return null; const r = e.getBoundingClientRect(); "
+                "if (!r || (r.width === 0 && r.height === 0)) return null; "
+                "return {x: r.left + r.width / 2, y: r.top + r.height / 2}; })()",
+            )
+        except CDPError:
+            return None
+        if not isinstance(res, dict):
+            return None
+        x, y = res.get("x"), res.get("y")
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return None
+        return float(x), float(y)
+
+    def click_at(self, session_id: str, x: float, y: float) -> None:
+        """Click chuột tại toạ độ (sinh event `isTrusted: true`)."""
+        try:
+            self.call(
+                "Input.dispatchMouseEvent",
+                {"type": "mouseMoved", "x": x, "y": y},
+                session_id=session_id,
+            )
+            time.sleep(random.uniform(0.03, 0.08))
+            self.call(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mousePressed",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "clickCount": 1,
+                },
+                session_id=session_id,
+            )
+            time.sleep(random.uniform(0.04, 0.09))
+            self.call(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mouseReleased",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "clickCount": 1,
+                },
+                session_id=session_id,
+            )
+        except CDPError:
+            pass
+
+    def press_enter(self, session_id: str) -> None:
+        """Nhấn Enter (submit form).
+
+        Chuỗi 3 sự kiện đúng chuẩn Blink: `rawKeyDown` (kèm `text`) →
+        `char` → `keyUp`. Thiếu `char` thì form không submit.
+        """
+        for ev_type, extra in (
+            ("rawKeyDown", {"text": "\r"}),
+            ("char", {"text": "\r", "unmodifiedText": "\r"}),
+            ("keyUp", {}),
+        ):
+            params: dict[str, Any] = {
+                "type": ev_type,
+                "key": "Enter",
+                "code": "Enter",
+                "windowsVirtualKeyCode": 13,
+                "nativeVirtualKeyCode": 13,
+            }
+            params.update(extra)
+            try:
+                self.call("Input.dispatchKeyEvent", params, session_id=session_id)
+            except CDPError:
+                pass
+            if ev_type == "rawKeyDown":
+                time.sleep(random.uniform(0.05, 0.1))
+
+    def click_selector(self, session_id: str, selector: str) -> bool:
+        """Click element theo selector.
+
+        Dùng `getBoundingClientRect` + `Input.dispatchMouseEvent` thay vì
+        `element.click()` bằng JS — sự kiện chuột do CDP sinh có
+        `isTrusted: true`, còn `.click()` bằng JS thì không.
+        """
+        center = self.rect_center(session_id, selector)
+        if center is None:
+            return False
+        self.click_at(session_id, center[0], center[1])
+        return True
 
     def close_browser(self) -> None:
         """Yêu cầu Chrome đóng graceful (để flush cookie vào DB)."""

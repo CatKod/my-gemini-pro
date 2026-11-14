@@ -57,6 +57,12 @@ HIDDEN = [
     "orchestrator.runners.gemini",
     "orchestrator.runners.agy",
     "orchestrator.runners.canvas",
+    # Module tài khoản mới: registry + credential store (DPAPI) + auto login.
+    # Chúng được import *bên trong* hàm (lazy import) nên PyInstaller không
+    # phát hiện tĩnh → khai báo tường minh.
+    "orchestrator.accounts",
+    "orchestrator.credentials",
+    "orchestrator.auto_login",
 ]
 
 # Thư mục chứa `orchestrator/` và `tools/` — cần cho PyInstaller resolve
