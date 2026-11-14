@@ -251,6 +251,24 @@ def cmd_cookie(args: argparse.Namespace) -> int:
     return 0 if out.get("ok", True) else 1
 
 
+def cmd_runner(args: argparse.Namespace) -> int:
+    """Chạy runner trong tiến trình hiện tại (lệnh nội bộ).
+
+    Dùng khi bản `.exe` đã đóng gói cần spawn runner con: không có
+    `python -m orchestrator.runners.<x>` nữa, nên ta gọi lại chính
+    executable với `__runner__ <module> <job_id>`.
+    """
+    import importlib
+
+    try:
+        mod = importlib.import_module(f"orchestrator.runners.{args.module}")
+    except ImportError as e:
+        print(f"Không import được runner {args.module!r}: {e}", file=sys.stderr)
+        return 2
+    sys.argv = [f"orchestrator.runners.{args.module}", args.job_id]
+    return int(mod.main())
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
@@ -334,6 +352,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--email", default=None, help="email tài khoản")
     p.add_argument("--export", default=None, help="file JSON export Cookie-Editor (cho adopt)")
     p.set_defaults(func=cmd_cookie)
+
+    # Lệnh nội bộ: dùng để spawn runner khi chạy từ `.exe` đã đóng gói.
+    # Khi frozen, `sys.executable` chính là file .exe — không thể dùng
+    # `python -m orchestrator.runners.<x>` nữa. Thay vào đó ta gọi lại chính
+    # executable với lệnh này.
+    p = sub.add_parser("__runner__", help=argparse.SUPPRESS)
+    p.add_argument("module")
+    p.add_argument("job_id")
+    p.set_defaults(func=cmd_runner)
 
     return ap
 

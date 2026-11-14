@@ -33,6 +33,11 @@ EXCLUDES = [
     "setuptools",
     "pip",
     "IPython",
+    # Playwright kéo theo driver Node (~109 MB) → bản .exe phình từ 68 lên
+    # 183 MB. Bản .exe ưu tiên nhẹ + startup nhanh; job `canvas` (browser
+    # thật) cần Playwright nên chạy bằng Python source thay vì .exe.
+    # Runner canvas sẽ báo lỗi rõ ràng nếu thiếu Playwright.
+    "playwright",
 ]
 
 HIDDEN = [
@@ -44,7 +49,29 @@ HIDDEN = [
     # `cookie_sync` dùng websocket-client thuần Python (tránh kéo Playwright
     # driver ~109 MB vào bản .exe).
     "websocket",
+    # Runner `gemini` import `gemini_pool` từ `tools/` — phải bundle để
+    # bản .exe chạy được (source `tools/` không tồn tại cạnh file .exe).
+    "gemini_pool",
+    # Runner được spawn bằng lệnh nội bộ `__runner__` → `importlib` import
+    # theo tên lúc chạy, PyInstaller không phát hiện tĩnh → khai báo tường minh.
+    "orchestrator.runners.gemini",
+    "orchestrator.runners.agy",
+    "orchestrator.runners.canvas",
 ]
+
+# Thư mục chứa `orchestrator/` và `tools/` — cần cho PyInstaller resolve
+# import khi đóng gói.
+#
+# SPECPATH = thư mục chứa file .spec (= `<repo>/orchestrator`).
+# `entry_cli.py` nằm cùng thư mục đó; `tools/gemini_pool.py` nằm ở `<repo>/tools`.
+# Dùng đường dẫn tuyệt đối cho entry để không phụ thuộc cwd lúc build.
+import os as _os
+
+_SPEC_DIR = _os.path.abspath(SPECPATH)              # <repo>/orchestrator
+_REPO_ROOT = _os.path.dirname(_SPEC_DIR)            # <repo>
+PATHS = [_SPEC_DIR, _REPO_ROOT, _os.path.join(_REPO_ROOT, "tools")]
+_ENTRY_CLI = _os.path.join(_SPEC_DIR, "entry_cli.py")
+_ENTRY_GUI = _os.path.join(_SPEC_DIR, "entry_gui.py")
 
 # `gemini_webapi` cần data file (models.json / images) đi kèm package.
 datas = []
@@ -67,8 +94,8 @@ except Exception:
 
 # ---- Console (headless) ----------------------------------------------------
 a = Analysis(
-    ["entry_cli.py"],
-    pathex=["."],
+    [_ENTRY_CLI],
+    pathex=PATHS,
     binaries=[],
     datas=datas,
     hiddenimports=HIDDEN,
@@ -110,8 +137,8 @@ coll = COLLECT(
 
 # ---- GUI (Tkinter) ---------------------------------------------------------
 b = Analysis(
-    ["entry_gui.py"],
-    pathex=["."],
+    [_ENTRY_GUI],
+    pathex=PATHS,
     binaries=[],
     datas=datas,
     hiddenimports=HIDDEN + ["tkinter"],

@@ -405,14 +405,19 @@ Docs: `docs/ORCHESTRATOR.md` (kiến trúc), `docs/ORCHESTRATOR-USAGE.md` (cách
 1. **Reload Cursor window** → MCP `orchestrator` xuất hiện trong tool list.
 2. ~~**Export cookie lại** cho pool `windows`~~ → **ĐÃ GIẢI QUYẾT** bằng cookie
    tự động (mục 11). Chạy `sync` là được, không cần Cookie-Editor nữa.
-3. Export cookie pool `wsl` (`catkingmv@gmail.com`) → dùng `adopt` 1 lần với
-   file export từ Chrome profile "Vĩnh", hoặc đơn giản hơn:
-   `python -m orchestrator.cookie_sync login --account catkingmv` → đăng nhập
-   Google trong Chrome riêng → `sync --account catkingmv` (pool `wsl` tự map).
-4. Đăng nhập Google vào Chrome profile `Profile 2` ("Canvas Acc") → `canvas`
+3. **Pool `wsl`** (`catkingmv@gmail.com`) → dùng GUI: "Tài khoản Gemini" →
+   chọn account → "Đăng nhập (Chrome)" → đăng nhập → "Đồng bộ cookie".
+   Hoặc CLI: `python -m orchestrator.cookie_sync login --account catkingmv`.
+4. **Tài khoản thứ 3** (`t1vodichcktg2325@gmail.com`, Chrome profile "Profile 3"):
+   dùng GUI "Tài khoản Gemini" → Thêm (account `t1vodich`, pool `acc3`) →
+   "Đăng nhập (Chrome)" → đồng bộ.
+5. Đăng nhập Google vào Chrome profile `Profile 2` ("Canvas Acc") → `canvas`
    (browser) mới sinh được artifact thật.
-5. ~~Test `deep_research` end-to-end qua orchestrator~~ → **ĐÃ XONG**
-   (job `j_502980b1f499`, 33 nguồn) + chat end-to-end (`j_2ed016af1eca`).
+6. ~~Test `deep_research` end-to-end qua orchestrator~~ → **ĐÃ XONG**
+   (job `j_502980b1f499`, 33 nguồn) + chat end-to-end (`j_2ed016af1eca`)
+   + `.exe` end-to-end (`j_e81fdc8d6588`).
+7. **Session `mmeo` đang chết** (`UNAUTHENTICATED`) → cần `adopt` lại với file
+   export Cookie-Editor **mới** (file cũ 13/11 đã hết hạn), hoặc `login` lại.
 6. `Profile 2` đã tạo nhưng chưa đăng nhập — có thể xoá nếu không dùng:
    xoá thư mục `Profile 2` + entry trong `Local State`.
 
@@ -486,6 +491,12 @@ Orchestrator sở hữu **Chrome riêng** tại `%LOCALAPPDATA%\OrchestratorChro
 | `.exe` ghi pool nhầm vào `dist/.../_internal/pools` | `_resolve_pools_dir()` xử lý `sys.frozen` (cwd → `%LOCALAPPDATA%\Orchestrator\pools`) |
 | `status`/`sync` map pool theo tên account (`mmeo.json`) thay vì pool thật (`windows.json`) | `ACCOUNT_POOLS` + `default_pool_for(account)` |
 | Đọc `Network/Cookies` offline fail `WinError 32` khi Chrome đang chạy | Báo `cookies_in_db: -1` (= không đọc được) thay vì `0` (nghĩa là không có cookie) — kiểm tra `pool_cookies` thay thế |
+| **Cookie còn nhưng session CHẾT** → mọi DR fail `Permission denied` | `sync` gọi `_probe_session()` → `account_status`; báo `warning` nếu `!= ACTIVE` |
+| `_looks_signed_out` trả sai (trang chưa đăng nhập vẫn hiện "Cuộc trò chuyện mới") | Chỉ dựa vào dấu hiệu mạnh ("thư viện"/"library") để kết luận đã đăng nhập |
+| `.exe` spawn runner bằng `sys.executable -m orchestrator.runners.x` → fail (vì `sys.executable` là file .exe) | Lệnh nội bộ `__runner__ <module> <job_id>` khi frozen |
+| PyInstaller không bundle `gemini_pool` / `orchestrator.runners.*` (import động) | `pathex` trỏ `<repo>/tools` + `hiddenimports` tường minh |
+| Playwright kéo driver Node 109 MB → .exe phình 68 → 183 MB | Exclude `playwright`; job `canvas` chạy bằng Python source, runner báo lỗi rõ ràng |
+| Runner (`.exe`) cwd = `_internal` → không thấy `pools/` | `dispatch._spawn` kế thừa `os.getcwd()`; `_resolve_dir` đi lên cây thư mục |
 
 ### Rủi ro
 
@@ -511,9 +522,13 @@ Orchestrator sở hữu **Chrome riêng** tại `%LOCALAPPDATA%\OrchestratorChro
 - **Chat end-to-end sau khi `sync` tự động** (job `j_2ed016af1eca`): pool
   `windows`, text `"SYNC_OK"`, `cid=c_707597ae1ecb3e9b` → cookie tự động dùng
   được thật, không chỉ Deep Research.
-- `cookie sync --account mmeo` → 21 cookie, ghi đúng `pools/windows.json`
-  (mapping account → pool tự động).
-- `cookie status --account mmeo` → `pool_cookies: 2`, `cookies_in_db: -1`
-  (Chrome giữ lock — đúng semantics sau fix).
+- **`.exe` chạy end-to-end** (job `j_e81fdc8d6588`): `orchestrator-cli.exe submit
+  chat` → DONE, text `"EXE_OK"` → runner con spawn + pool resolve + Gemini API
+  đều OK từ bản đóng gói.
+- **GUI `.exe`**: mở được, title "Orchestrator", cửa sổ "Tài khoản Gemini" render
+  đúng tiếng Việt, bảng liệt kê account (`mmeo` 19 cookie DB, `catkingmv` 3).
+- **Phát hiện quan trọng**: cookie có thể **còn** nhưng session **chết**
+  (`account_status=UNAUTHENTICATED`) → mọi DR fail `Permission denied`.
+  `sync` giờ probe session thật và cảnh báo rõ ràng.
 - `python -m orchestrator.selftest` → `SELFTEST PASS` sau khi sửa mapping.
 

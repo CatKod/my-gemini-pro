@@ -41,10 +41,34 @@ python -m orchestrator.gui
 - Nhật ký tiến độ của job đang chọn (auto refresh 2s)
 - Kết quả cuối
 - Nút **Tạo hồ sơ Chrome** — tạo hồ sơ mới + mở Chrome để bạn đăng nhập
+- Nút **Tài khoản Gemini** — cửa sổ quản lý tài khoản (thêm account, đăng nhập,
+  nhập cookie từ file Cookie-Editor, đồng bộ, kiểm tra session)
 - Nút **Đồng bộ cookie** — lấy cookie Gemini mới tự động (không cần Cookie-Editor)
 - Nút **Huỷ job**, **Mở report**
 
 Đóng GUI **không** ảnh hưởng job đang chạy — GUI chỉ đọc SQLite.
+
+## Thêm tài khoản Gemini mới (GUI)
+
+Bấm **"Tài khoản Gemini"** → cửa sổ mới:
+
+| Bước | Việc |
+|---|---|
+| 1 | Nhập **Tên account** (vd `t1vodich`), **Pool** (vd `acc3`), **Email** → bấm **Thêm** |
+| 2 | Chọn account trong bảng → bấm **"Đăng nhập (Chrome)"** → đăng nhập Google trong cửa sổ Chrome riêng → đóng Chrome |
+| 3 | Bấm **"Đồng bộ cookie"** → cookie tự vào pool |
+
+Hoặc nếu đã export cookie từ Cookie-Editor:
+bấm **"Nhập cookie (file)"** → chọn file JSON → xong.
+
+> **Tên account** = tên thư mục Chrome riêng
+> (`%LOCALAPPDATA%\OrchestratorChrome\<tên>`). **Pool** = tên file trong
+> `pools/`. Mapping account → pool được lưu bền trong
+> `pools/account_pools.json` nên không mất khi restart.
+
+Nút **"Kiểm tra session"** gọi API thật để xem session còn hiệu lực không —
+phân biệt "cookie còn" với "session chết" (cookie còn nhưng Google đã hết
+hạn → mọi Deep Research fail với `Permission denied`).
 
 ## Cookie Gemini tự động (không cần Cookie-Editor)
 

@@ -123,15 +123,58 @@ GEMINI_URL = "https://gemini.google.com/app"
 
 #: Mapping account -> tên pool trong `pools/`. Tên pool khớp pool Antigravity
 #: để routing `auto` nhất quán (xem `docs/ARCHITECTURE.md`).
+#:
+#: Được persist trong `pools/.account_pools.json` khi user thêm account mới
+#: từ GUI, nên không mất khi restart.
 ACCOUNT_POOLS = {
     "mmeo": "windows",
     "catkingmv": "wsl",
 }
 
+#: File lưu mapping account -> pool (thêm bởi GUI).
+ACCOUNT_POOLS_FILE = "account_pools.json"
+
+
+def _load_account_pools() -> dict[str, str]:
+    """Đọc mapping account -> pool đã lưu (nếu có)."""
+    f = POOLS_DIR / ACCOUNT_POOLS_FILE
+    if not f.is_file():
+        return {}
+    try:
+        raw = _read_json(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}
+
+
+def _save_account_pools(mapping: dict[str, str]) -> None:
+    """Lưu mapping account -> pool vào `pools/.account_pools.json`."""
+    try:
+        _write_json_atomic(POOLS_DIR / ACCOUNT_POOLS_FILE, mapping)
+    except OSError:
+        pass
+
+
+def set_account_pool(account: str, pool: str) -> None:
+    """Gán pool cho account và lưu bền vững."""
+    key = account.lower()
+    ACCOUNT_POOLS[key] = pool
+    mapping = _load_account_pools()
+    mapping[key] = pool
+    _save_account_pools(mapping)
+
 
 def default_pool_for(account: str) -> str:
     """Pool mặc định của 1 account (fallback: chính tên account)."""
-    return ACCOUNT_POOLS.get(account.lower(), account)
+    key = account.lower()
+    if key in ACCOUNT_POOLS:
+        return ACCOUNT_POOLS[key]
+    saved = _load_account_pools()
+    if key in saved:
+        return saved[key]
+    return account
 
 
 # ---------------------------------------------------------------------------
@@ -388,15 +431,30 @@ class ChromeSession:
 
 
 def _looks_signed_out(page_text: str) -> bool:
+    """Trang Gemini có đang yêu cầu đăng nhập không?
+
+    Bẫy đã gặp: trang **chưa đăng nhập** vẫn hiện "Cuộc trò chuyện mới" →
+    logic "có signed-in marker là được coi là đã đăng nhập" trả về sai
+    (false positive). Thực tế trang chưa đăng nhập có nút "Đăng nhập" và
+    "Tải ứng dụng"; trang đã đăng nhập có "Thư viện", "Đã lên lịch", lịch sử chat.
+
+    Quy tắc: có CTA đăng nhập → coi như CHƯA đăng nhập (trừ khi có dấu hiệu
+    đã đăng nhập rõ ràng như "thư viện"/"library").
+    """
     t = (page_text or "").lower()
-    signed_out_markers = ("sign in", "đăng nhập")
-    signed_in_markers = (
-        "new chat",
-        "cuộc trò chuyện mới",
+    signed_out_markers = (
+        "sign in",
+        "đăng nhập",
+        "download the app",
+        "tải ứng dụng",
+    )
+    strong_signed_in_markers = (
         "thư viện",
         "library",
+        "đã lên lịch",
+        "gems",
     )
-    if any(m in t for m in signed_in_markers):
+    if any(m in t for m in strong_signed_in_markers):
         return False
     return any(m in t for m in signed_out_markers)
 
@@ -437,6 +495,16 @@ def adopt(
     signed_in = REQUIRED in live and not _looks_signed_out(page_text)
 
     name = pool_name or default_pool_for(account)
+    # Giữ email đã biết nếu không truyền mới (tránh mất khi sync chạy lại).
+    if not account_email:
+        existing = POOLS_DIR / f"{name}.json"
+        if existing.is_file():
+            try:
+                prev = _read_json(existing)
+                if isinstance(prev, dict):
+                    account_email = prev.get("account_email")
+            except (OSError, ValueError):
+                pass
     payload = {
         "name": name,
         "account_email": account_email,
@@ -450,6 +518,7 @@ def adopt(
         ],
     }
     _write_json_atomic(POOLS_DIR / f"{name}.json", payload)
+    set_account_pool(account, name)
 
     return {
         "ok": True,
@@ -516,7 +585,6 @@ def sync(
         {
             "name": name,
             "account_email": account_email or payload.get("account_email"),
-            "browser": "chrome",
             "profile": account,
             "source": "orchestrator-cookie-sync",
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -528,6 +596,14 @@ def sync(
         }
     )
     _write_json_atomic(pool_file, payload)
+    set_account_pool(account, name)
+
+    # Kiểm tra session thật (không chỉ cookie còn sống).
+    #
+    # Bẫy đã gặp: cookie vẫn còn (21 cookie) nhưng Google đã hết hạn session
+    # → `gemini_webapi` trả `UNAUTHENTICATED`, mọi Deep Research fail với
+    # "Permission denied". Chỉ đọc cookie là không đủ.
+    session = _probe_session(live)
 
     return {
         "ok": True,
@@ -535,7 +611,63 @@ def sync(
         "cookies": len(live),
         "pool_file": str(pool_file),
         "updated_at": payload["updated_at"],
+        "session_ok": session.get("ok"),
+        "account_status": session.get("account_status"),
+        "warning": session.get("warning"),
     }
+
+
+def _probe_session(cookies: dict[str, str]) -> dict[str, Any]:
+    """Kiểm tra session Gemini còn sống không (gọi API thật).
+
+    Trả về `{"ok": bool, "account_status": str|None, "warning": str|None}`.
+    Không raise — lỗi mạng chỉ là `ok=False` + warning.
+    """
+    if REQUIRED not in cookies:
+        return {"ok": False, "account_status": None, "warning": "thiếu cookie 1PSID"}
+
+    try:
+        import asyncio
+
+        from gemini_webapi import GeminiClient
+    except ImportError as e:
+        return {"ok": None, "account_status": None, "warning": f"thiếu gemini_webapi: {e}"}
+
+    async def _probe() -> str | None:
+        client = GeminiClient(
+            secure_1psid=cookies[REQUIRED],
+            secure_1psidts=cookies.get(OPTIONAL),
+            verbose=False,
+        )
+        try:
+            await client.init(auto_refresh=False)
+            status = getattr(client.account_status, "name", None)
+            return status
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    try:
+        status = asyncio.run(_probe())
+    except Exception as e:
+        return {
+            "ok": None,
+            "account_status": None,
+            "warning": f"không kiểm tra được session: {type(e).__name__}: {e}",
+        }
+
+    ok = status == "ACTIVE"
+    warning = None
+    if not ok:
+        warning = (
+            f"Session KHÔNG còn hiệu lực (account_status={status}). "
+            "Cookie vẫn còn nhưng Google đã hết hạn session → mọi Deep Research "
+            "sẽ fail với 'Permission denied'. Cần chạy `adopt` lại (file export "
+            "Cookie-Editor mới) hoặc `login` để đăng nhập lại trong Chrome riêng."
+        )
+    return {"ok": ok, "account_status": status, "warning": warning}
 
 
 def login(account: str, *, port: int | None = None) -> dict[str, Any]:
@@ -624,17 +756,21 @@ def status(account: str, *, pool_name: str | None = None) -> dict[str, Any]:
     pool_name = pool_name or default_pool_for(account)
     pool_file = POOLS_DIR / f"{pool_name}.json"
     pool_cookies = 0
+    account_email = None
     if pool_file.is_file():
         try:
             payload = _read_json(pool_file)
             items = payload.get("cookies") if isinstance(payload, dict) else None
             pool_cookies = len(items) if isinstance(items, list) else 0
+            if isinstance(payload, dict):
+                account_email = payload.get("account_email")
         except (OSError, ValueError):
             pool_cookies = 0
 
     return {
         "account": account,
         "pool": pool_name,
+        "account_email": account_email,
         "user_data_dir": str(udd),
         "profile_exists": udd.is_dir(),
         "cookies_in_db": cookie_count,

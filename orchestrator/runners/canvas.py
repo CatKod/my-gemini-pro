@@ -149,7 +149,15 @@ async def _run_browser(
     cài, version mismatch, `no_viewport` lỗi). Cách ổn định hơn: tự spawn
     Chrome thật với `--remote-debugging-port`, rồi Playwright `connect_over_cdp`.
     """
-    from playwright.async_api import async_playwright
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError(
+            "Job `canvas` cần Playwright, nhưng bản .exe đã cố tình không bundle "
+            "Playwright (driver Node ~109 MB) để giữ .exe nhẹ. "
+            "Chạy job canvas bằng Python source thay vì .exe: "
+            "`python -m orchestrator.orch_cli submit canvas ...`"
+        ) from e
 
     directory = params.get("profile_directory") or DEFAULT_PROFILE_DIR
     if not _profile_exists(directory):

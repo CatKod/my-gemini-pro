@@ -38,8 +38,9 @@ def _resolve_dir(env_name: str, name: str) -> Path:
 
     1. Biến môi trường tường minh (`GEMINI_POOLS_DIR` / `GEMINI_REPORTS_DIR`).
     2. Source → `<repo>/<name>`.
-    3. `.exe` → `<cwd>/<name>` nếu cwd trông như repo, else
-       `%LOCALAPPDATA%\\Orchestrator\\<name>`.
+    3. `.exe` → tìm `<name>` bằng cách đi **lên cây thư mục** từ cwd (tối đa 5
+       cấp) — cho phép chạy `.exe` từ bất kỳ đâu trong repo. Nếu không có,
+       fallback `%LOCALAPPDATA%\\Orchestrator\\<name>`.
     """
     env = os.environ.get(env_name)
     if env:
@@ -49,9 +50,16 @@ def _resolve_dir(env_name: str, name: str) -> Path:
         return REPO_ROOT / name
 
     cwd = Path.cwd()
-    if (cwd / name).is_dir() or (cwd / ".git").exists():
-        return cwd / name
+    for candidate in [cwd, *cwd.parents][:5]:
+        target = candidate / name
+        if target.is_dir():
+            return target
+        if (candidate / ".git").exists() and (candidate / name).is_dir():
+            return candidate / name
+    # Không tìm thấy `pools/` gần cwd → dùng thư mục data cố định.
     local = Path(os.environ.get("LOCALAPPDATA", "")) / "Orchestrator"
+    local.mkdir(parents=True, exist_ok=True)
+    (local / name).mkdir(parents=True, exist_ok=True)
     return local / name
 
 
@@ -168,13 +176,15 @@ def load_pool(path: Path) -> Pool:
 
 
 def load_pools(pools_dir: Path | None = None) -> list[Pool]:
-    """Load tất cả pool trong `pools/` (bỏ qua `example.json` và file hỏng)."""
+    """Load tất cả pool trong `pools/` (bỏ qua file metadata và file hỏng)."""
     d = pools_dir or POOLS_DIR
     if not d.is_dir():
         return []
     pools: list[Pool] = []
     for f in sorted(d.glob("*.json")):
-        if f.name == "example.json":
+        # `example.json` = mẫu; `account_pools.json` = mapping account->pool
+        # (metadata của orchestrator, không phải pool).
+        if f.name in ("example.json", "account_pools.json"):
             continue
         try:
             pools.append(load_pool(f))

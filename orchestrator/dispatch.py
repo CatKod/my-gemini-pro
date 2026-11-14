@@ -51,6 +51,19 @@ def _python_exe() -> str:
     return sys.executable or "python"
 
 
+def _spawn_args(module: str, job_id: str) -> list[str]:
+    """Lệnh để chạy runner.
+
+    - Chạy từ source: `python -m orchestrator.runners.<module> <job_id>`.
+    - Chạy từ `.exe` (frozen): `sys.executable` chính là file .exe, nên
+      `-m orchestrator.runners.<module>` không có nghĩa. Thay vào đó gọi lại
+      chính executable với lệnh nội bộ `__runner__ <module> <job_id>`.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "__runner__", module, job_id]
+    return [_python_exe(), "-u", "-m", f"orchestrator.runners.{module}", job_id]
+
+
 def _spawn(module: str, job_id: str, log: Path) -> subprocess.Popen:
     """Spawn runner như process con độc lập."""
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -60,8 +73,14 @@ def _spawn(module: str, job_id: str, log: Path) -> subprocess.Popen:
         "stdout": fh,
         "stderr": subprocess.STDOUT,
         "stdin": subprocess.DEVNULL,
-        "cwd": str(REPO_ROOT),
     }
+    if getattr(sys, "frozen", False):
+        # Bản .exe: `REPO_ROOT` là `<dist>/orchestrator-cli/_internal` — không
+        # có `pools/` ở đó. Kế thừa cwd của tiến trình cha (thư mục user
+        # đang chạy lệnh) để `pools/`/`reports/` được resolve đúng.
+        kwargs["cwd"] = os.getcwd()
+    else:
+        kwargs["cwd"] = str(REPO_ROOT)
     if os.name == "nt":
         flags = (
             subprocess.CREATE_NEW_PROCESS_GROUP
@@ -71,10 +90,7 @@ def _spawn(module: str, job_id: str, log: Path) -> subprocess.Popen:
     else:
         kwargs["start_new_session"] = True
 
-    return subprocess.Popen(
-        [_python_exe(), "-u", "-m", f"orchestrator.runners.{module}", job_id],
-        **kwargs,
-    )
+    return subprocess.Popen(_spawn_args(module, job_id), **kwargs)
 
 
 def submit(
