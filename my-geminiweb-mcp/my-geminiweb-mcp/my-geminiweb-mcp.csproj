@@ -24,10 +24,16 @@
 
     <!-- Set recommended package metadata -->
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageId>SampleMcpServer</PackageId>
+    <PackageId>MyGeminiWebMcp</PackageId>
     <PackageVersion>0.1.0-beta</PackageVersion>
-    <PackageTags>AI; MCP; server; stdio</PackageTags>
-    <Description>An MCP server using the MCP C# SDK.</Description>
+    <PackageTags>AI; MCP; server; stdio; gemini; google; chat</PackageTags>
+    <Description>MCP server for Gemini Web: multi-account pool with automatic failover, conversation continuity, and a Native AOT single-file binary. No Python runtime required.</Description>
+    <Authors>kimvi</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/kimvi/my-geminiweb-mcp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/kimvi/my-geminiweb-mcp</RepositoryUrl>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
   </PropertyGroup>
 
   <!-- Include additional files for browsing the MCP server. -->

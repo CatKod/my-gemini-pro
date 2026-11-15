@@ -1,16 +1,24 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using MyGeminiWebMcp;
+using MyGeminiWebMcp.Accounts;
+using MyGeminiWebMcp.Tools;
 
 var builder = Host.CreateApplicationBuilder(args);
 
-// Configure all logs to go to stderr (stdout is used for the MCP protocol messages).
+// All logs must go to stderr: stdout carries the MCP protocol messages.
 builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
 
-// Add the MCP services: the transport to use (stdio) and the tools to register.
+var paths = AppPaths.Resolve();
+var pool = AccountPool.Load(paths.PoolFile);
+
+builder.Services.AddSingleton(paths);
+builder.Services.AddSingleton(pool);
+
 builder.Services
     .AddMcpServer()
     .WithStdioServerTransport()
-    .WithTools<RandomNumberTools>();
+    .WithTools<GeminiTools>();
 
 await builder.Build().RunAsync();

@@ -1,22 +1,29 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
-  "description": "<your description here>",
-  "name": "io.github.<your GitHub username here>/<your repo name>",
+  "description": "Gemini Web chat as an MCP server: multi-account pool, automatic failover, and conversation continuity.",
+  "name": "io.github.kimvi/my-geminiweb-mcp",
   "version": "0.1.0-beta",
   "packages": [
     {
       "registryType": "nuget",
-      "identifier": "<your package ID here>",
+      "identifier": "MyGeminiWebMcp",
       "version": "0.1.0-beta",
       "transport": {
         "type": "stdio"
       },
       "packageArguments": [],
-      "environmentVariables": []
+      "environmentVariables": [
+        {
+          "name": "GEMINIWEB_MCP_HOME",
+          "description": "Folder holding accounts.json. Defaults to %LOCALAPPDATA%\\MyGeminiWebMcp.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
     }
   ],
   "repository": {
-    "url": "https://github.com/<your GitHub username here>/<your repo name>",
+    "url": "https://github.com/kimvi/my-geminiweb-mcp",
     "source": "github"
   }
 }
