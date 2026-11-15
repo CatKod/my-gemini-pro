@@ -14,11 +14,41 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
 
 var paths = AppPaths.Resolve();
+
+// `--bridge-only` runs just the cookie bridge, without the MCP server.
+//
+// Why it exists: an MCP server speaks over stdio, so it lives and dies with the client
+// that started it — and it shuts down the moment that client's stdin closes. The browser
+// extension, on the other hand, needs a bridge that is always there. This mode gives
+// the extension a stable counterpart: start it once, and every MCP session finds a
+// bridge already listening (on the same port, and with the same persisted token).
+if (args.Contains("--bridge-only", StringComparer.OrdinalIgnoreCase))
+{
+    var bridgeOnlyPool = AccountPool.Load(paths.PoolFile);
+    using var bridgeOnly = new CookieBridge(bridgeOnlyPool, paths.BridgeTokenFile);
+    try
+    {
+        bridgeOnly.Start();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[geminiweb] cookie bridge could not start: {ex.Message}");
+        return 1;
+    }
+
+    Console.Error.WriteLine("[geminiweb] cookie bridge endpoint: " + bridgeOnly.Endpoint);
+    Console.Error.WriteLine("[geminiweb] cookie bridge token:    " + bridgeOnly.Token);
+    Console.Error.WriteLine("[geminiweb] bridge-only mode — press Ctrl+C to stop.");
+
+    await Task.Delay(Timeout.Infinite, CancellationToken.None);
+    return 0;
+}
+
 var pool = AccountPool.Load(paths.PoolFile);
 
 // The bridge lets a browser extension hand over session cookies. It binds to the loopback
 // interface only and requires a shared token, so it is not reachable from the network.
-var bridge = new CookieBridge(pool);
+var bridge = new CookieBridge(pool, paths.BridgeTokenFile);
 try
 {
     bridge.Start();
@@ -55,3 +85,5 @@ finally
     keepAlive.Dispose();
     bridge.Dispose();
 }
+
+return 0;

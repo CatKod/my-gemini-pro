@@ -188,11 +188,13 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
             ["running"] = bridge.Running,
             ["endpoint"] = bridge.Endpoint,
             ["token"] = bridge.Token,
+            ["tokenFile"] = paths.BridgeTokenFile,
             ["poolFile"] = paths.PoolFile,
             ["hint"] =
                 "Install the 'geminiweb-mcp' extension (chrome://extensions -> Developer mode -> " +
                 "Load unpacked), open its popup, paste this endpoint and token, then press " +
-                "'Send cookies' while signed in to gemini.google.com.",
+                "'Send cookies' while signed in to gemini.google.com. The token is persisted, so " +
+                "you only paste it once.",
         }.ToJsonString();
     }
 

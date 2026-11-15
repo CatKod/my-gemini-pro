@@ -15,6 +15,12 @@
 const AUTH_COOKIES = ["__Secure-1PSID", "__Secure-1PSIDTS"];
 const GEMINI_HOSTS = ["gemini.google.com", "accounts.google.com"];
 
+// Port mặc định của bridge C# + số dự phòng. Server tự dời sang port trống khi
+// port mặc định bị chiếm (ví dụ instance cũ chưa tắt), nên extension phải dò
+// thay vì hard-code.
+const DEFAULT_PORT = 9478;
+const PORT_SCAN_RANGE = 20;
+
 // Cookie được giữ lại khi gửi đi. `NID` và họ `__Secure-3PSID*` phải đi kèm:
 // session chỉ có `__Secure-1PSID` sẽ bị Google từ chối.
 const KEEP_COOKIES = [
@@ -29,11 +35,67 @@ const KEEP_COOKIES = [
 async function getConfig() {
   const cfg = await chrome.storage.local.get(["endpoint", "token", "autoSend", "account"]);
   return {
-    endpoint: cfg.endpoint || "http://127.0.0.1:9478/harvest",
+    endpoint: cfg.endpoint || "",
     token: cfg.token || "",
     autoSend: cfg.autoSend === true,
     account: cfg.account || "",
   };
+}
+
+// Dò port của bridge: thử `/ping` trên port mặc định rồi các port kế tiếp.
+// Trả về `{baseUrl, port}` của server đang sống, hoặc null.
+async function discoverBridge() {
+  for (let port = DEFAULT_PORT; port < DEFAULT_PORT + PORT_SCAN_RANGE; port++) {
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      const res = await fetch(base + "/ping", { method: "GET" });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data && data.service === "my-geminiweb-mcp-bridge") {
+          return { baseUrl: base, port };
+        }
+      }
+    } catch {
+      // Port này không có gì — thử port tiếp theo.
+    }
+  }
+  return null;
+}
+
+// Lấy endpoint + token từ server (endpoint `/config` chỉ phục vụ extension origin).
+async function fetchBridgeConfig(baseUrl) {
+  try {
+    const res = await fetch(baseUrl + "/config", { method: "GET" });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => ({}));
+    if (data && data.ok && data.endpoint && data.token) {
+      return { endpoint: data.endpoint, token: data.token };
+    }
+  } catch {
+    // Không đọc được — người dùng sẽ dán tay.
+  }
+  return null;
+}
+
+// Endpoint + token đầy đủ, dùng để gửi cookie.
+// Ưu tiên: token đã lưu → tự lấy từ server → dò port rồi lấy config.
+async function resolveEndpoint() {
+  const cfg = await getConfig();
+  if (cfg.token && cfg.endpoint) return cfg;
+
+  const found = await discoverBridge();
+  if (!found) return cfg;
+
+  const remote = await fetchBridgeConfig(found.baseUrl);
+  if (remote) {
+    await chrome.storage.local.set({
+      endpoint: remote.endpoint,
+      token: remote.token,
+    });
+    return { ...cfg, endpoint: remote.endpoint, token: remote.token };
+  }
+
+  return { ...cfg, endpoint: cfg.endpoint || `${found.baseUrl}/harvest` };
 }
 
 function isLoopback(url) {
@@ -98,7 +160,7 @@ async function collectCookies() {
 }
 
 async function sendCookies({ quiet = true } = {}) {
-  const cfg = await getConfig();
+  const cfg = await resolveEndpoint();
   if (!cfg.token) {
     if (!quiet) console.warn("[bridge] chưa có token — mở popup và dán token.");
     return { ok: false, error: "no-token" };
@@ -164,13 +226,48 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   if (msg && msg.type === "PING") {
     (async () => {
       const cfg = await getConfig();
-      try {
+      // Endpoint đã lưu → ping đúng chỗ đó, kèm lấy token nếu chưa có.
+      if (cfg.endpoint) {
         const base = cfg.endpoint.replace(/\/harvest.*$/, "");
-        const res = await fetch(base + "/ping");
-        respond({ ok: res.ok, endpoint: cfg.endpoint });
-      } catch (e) {
-        respond({ ok: false, error: String(e.message || e), endpoint: cfg.endpoint });
+        try {
+          const res = await fetch(base + "/ping");
+          if (res.ok) {
+            const remote = await fetchBridgeConfig(base);
+            if (remote) {
+              await chrome.storage.local.set({
+                endpoint: remote.endpoint,
+                token: remote.token,
+              });
+              respond({ ok: true, endpoint: remote.endpoint, token: remote.token, discovered: true });
+              return;
+            }
+            respond({ ok: true, endpoint: cfg.endpoint, token: cfg.token });
+            return;
+          }
+        } catch (e) {
+          // Rơi xuống dò port bên dưới.
+        }
       }
+      // Chưa cấu hình → dò port rồi lấy config.
+      const found = await discoverBridge();
+      if (found) {
+        const remote = await fetchBridgeConfig(found.baseUrl);
+        if (remote) {
+          await chrome.storage.local.set({
+            endpoint: remote.endpoint,
+            token: remote.token,
+          });
+          respond({ ok: true, endpoint: remote.endpoint, token: remote.token, discovered: true });
+          return;
+        }
+        respond({ ok: true, endpoint: `${found.baseUrl}/harvest`, token: "" });
+        return;
+      }
+      respond({
+        ok: false,
+        error: "không tìm thấy MyGeminiWebMcp bridge",
+        endpoint: cfg.endpoint || "",
+      });
     })();
     return true;
   }

@@ -20,6 +20,9 @@ internal sealed class AppPaths
     /// <summary>The JSON file describing the account pool.</summary>
     public string PoolFile { get; }
 
+    /// <summary>The file holding the cookie-bridge token, so the extension keeps working across restarts.</summary>
+    public string BridgeTokenFile { get; }
+
     /// <summary>The folder where generated files are written.</summary>
     public string DownloadsFolder { get; }
 
@@ -27,6 +30,7 @@ internal sealed class AppPaths
     {
         Home = home;
         PoolFile = Path.Combine(home, "accounts.json");
+        BridgeTokenFile = Path.Combine(home, "bridge_token.txt");
         DownloadsFolder = Path.Combine(home, "downloads");
     }
 

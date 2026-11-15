@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Gửi cookie Gemini (đã đăng nhập) về MyGeminiWebMcp chạy trên máy local.",
   "permissions": ["cookies", "storage", "tabs"],
-  "host_permissions": ["https://*.google.com/*", "http://127.0.0.1/*"],
+  "host_permissions": ["https://*.google.com/*", "http://127.0.0.1/*", "http://localhost/*"],
   "background": {
     "service_worker": "background.js"
   },
