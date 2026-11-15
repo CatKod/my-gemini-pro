@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "GeminiWeb MCP Cookie Bridge",
+  "version": "1.0.0",
+  "description": "Gửi cookie Gemini (đã đăng nhập) về MyGeminiWebMcp chạy trên máy local.",
+  "permissions": ["cookies", "storage", "tabs"],
+  "host_permissions": ["https://*.google.com/*", "http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "GeminiWeb MCP Cookie Bridge",
+    "default_popup": "popup.html"
+  }
+}

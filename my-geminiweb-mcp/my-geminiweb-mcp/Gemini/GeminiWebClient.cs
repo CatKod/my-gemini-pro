@@ -61,13 +61,38 @@ internal sealed class GeminiWebClient : IDisposable
     }
 
     private readonly HttpClient _http;
-    private readonly string _cookieHeader;
+    private readonly CookieJar _jar;
     private readonly string _sessionId;
     private int _reqId = Random.Shared.Next(10_000, 99_999);
 
-    public GeminiWebClient(string psid, string psidts, HttpClient? http = null)
+    /// <summary>
+    /// Creates a client for one account.
+    /// </summary>
+    /// <param name="psid">The <c>__Secure-1PSID</c> cookie value.</param>
+    /// <param name="psidts">The <c>__Secure-1PSIDTS</c> cookie value.</param>
+    /// <param name="http">An optional shared <see cref="HttpClient"/>.</param>
+    /// <param name="extraCookies">
+    /// Additional cookies from the same session (for example <c>NID</c>). They are required
+    /// for <see cref="RotateCookies"/> to mint a fresh <c>__Secure-1PSIDTS</c>.
+    /// </param>
+    public GeminiWebClient(
+        string psid,
+        string psidts,
+        HttpClient? http = null,
+        IEnumerable<KeyValuePair<string, string>>? extraCookies = null)
     {
-        _cookieHeader = $"__Secure-1PSID={psid}; __Secure-1PSIDTS={psidts}";
+        _jar = new CookieJar();
+        _jar.Set("__Secure-1PSID", psid);
+        _jar.Set("__Secure-1PSIDTS", psidts);
+        if (extraCookies is not null)
+        {
+            foreach (var (name, value) in extraCookies)
+            {
+                if (!string.IsNullOrEmpty(value))
+                    _jar.Set(name, value);
+            }
+        }
+
         _sessionId = Guid.NewGuid().ToString().ToUpperInvariant();
         _http = http ?? new HttpClient(new HttpClientHandler
         {
@@ -84,15 +109,33 @@ internal sealed class GeminiWebClient : IDisposable
     /// <summary>The session bootstrap values scraped from the app page.</summary>
     public GeminiSession? Session { get; private set; }
 
+    /// <summary>The cookie jar, so callers can read refreshed cookie values.</summary>
+    public CookieJar Cookies => _jar;
+
+    /// <summary>Refreshes the <c>__Secure-1PSIDTS</c> cookie.</summary>
+    public async Task<string?> RotateCookiesAsync(string accountKey, CancellationToken ct = default)
+    {
+        var rotator = new CookieRotator(_http, _jar);
+        return await rotator.RotateAsync(accountKey, ct);
+    }
+
     /// <summary>Reads the bootstrap page and extracts the session tokens.</summary>
-    public async Task<GeminiSession> InitializeAsync(CancellationToken ct = default)
+    /// <param name="fullJar">
+    /// When true, the whole cookie set is sent instead of only the two authentication
+    /// cookies. The extra cookies make the request look like the browser's, which is what
+    /// earns back the <c>__Secure-3PSID</c> family in the response.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<GeminiSession> InitializeAsync(bool fullJar = false, CancellationToken ct = default)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, InitUrl);
-        ApplyCommonHeaders(request);
+        ApplyCommonHeaders(request, fullJar);
 
         using var response = await _http.SendAsync(request, ct);
         response.EnsureSuccessStatusCode();
         string body = await response.Content.ReadAsStringAsync(ct);
+
+        _jar.Absorb(response);
 
         string token = Extract(body, "SNlM0e");
         if (token.Length == 0)
@@ -129,7 +172,7 @@ internal sealed class GeminiWebClient : IDisposable
         CancellationToken ct = default)
     {
         if (Session is null)
-            await InitializeAsync(ct);
+            await InitializeAsync(ct: ct);
 
         var session = Session!;
         string requestUuid = Guid.NewGuid().ToString().ToUpperInvariant();
@@ -204,6 +247,9 @@ internal sealed class GeminiWebClient : IDisposable
             throw new GeminiApiException(
                 $"StreamGenerate failed with HTTP {(int)response.StatusCode}: {Truncate(err, 300)}");
         }
+
+        // Google refreshes the session cookies on regular responses too.
+        _jar.Absorb(response);
 
         return await ReadReplyAsync(response, ct);
     }
@@ -311,7 +357,7 @@ internal sealed class GeminiWebClient : IDisposable
         return l1[0]?.GetValue<string>();
     }
 
-    private void ApplyCommonHeaders(HttpRequestMessage request)
+    private void ApplyCommonHeaders(HttpRequestMessage request, bool fullJar = false)
     {
         request.Headers.TryAddWithoutValidation(
             "User-Agent",
@@ -319,7 +365,7 @@ internal sealed class GeminiWebClient : IDisposable
             "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36");
         request.Headers.TryAddWithoutValidation("Origin", "https://gemini.google.com");
         request.Headers.TryAddWithoutValidation("Referer", "https://gemini.google.com/");
-        request.Headers.TryAddWithoutValidation("Cookie", _cookieHeader);
+        request.Headers.TryAddWithoutValidation("Cookie", _jar.ToHeader(onlyAuth: !fullJar));
     }
 
     private static string Extract(string body, string key)

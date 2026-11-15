@@ -85,6 +85,11 @@ coverage*.info
 *.coverage
 TestResults/
 
+# Python test artifacts (E2E scripts dùng thư mục tạm trong %TEMP%)
+__pycache__/
+my-geminiweb-mcp/tests/_home*/
+my-geminiweb-mcp/tests/*.pyc
+
 # NuGet
 *.nupkg
 *.snupkg

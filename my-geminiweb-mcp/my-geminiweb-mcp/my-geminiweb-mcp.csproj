@@ -40,6 +40,11 @@
   <ItemGroup>
     <None Include=".mcp\server.json" Pack="true" PackagePath="/.mcp/" />
     <None Include="README.md" Pack="true" PackagePath="/" />
+    <!-- Ship the browser extension so users can load it unpacked straight from the package. -->
+    <None Include="..\browser_extension\geminiweb-mcp-bridge\**\*"
+          Pack="true"
+          PackagePath="/browser_extension/geminiweb-mcp-bridge/"
+          Exclude="..\browser_extension\geminiweb-mcp-bridge\**\*.md" />
   </ItemGroup>
 
   <ItemGroup>
