@@ -1,6 +1,6 @@
 ---
-description: Quy tắc cho dự án my-gemini-pro — điều khiển Gemini Deep Research qua gemini_webapi. Khi user nhắn "continue", đọc docs/HANDOFF.md trước.
-globs: ["**/*.py", "**/*.md", "**/*.mdc"]
+description: Quy tắc cho dự án my-gemini-pro — điều khiển Gemini Deep Research qua gemini_webapi. Khi user nhắn "continue", đọc my-geminiweb-orchestrator/docs/HANDOFF.md trước.
+globs: ["**/*.py", "**/*.cs", "**/*.md", "**/*.mdc"]
 alwaysApply: true
 ---
 
@@ -12,17 +12,33 @@ Interactions API (vốn tính phí pay-as-you-go riêng).
 
 ---
 
+## 0. Cấu trúc repo (đã đổi, 2026-11-15)
+
+Repo chứa **2 project độc lập**:
+
+| Thư mục | Ngôn ngữ | Vai trò | Trạng thái |
+|---|---|---|---|
+| `my-geminiweb-mcp/` | C# / .NET | **MCP Server App** — hướng mới (SDK `ModelContextProtocol` chính thức) | 🆕 đang phát triển |
+| `my-geminiweb-orchestrator/` | Python | Orchestrator CDP/cookie + GUI + CLI + MCP (Python) | 📦 archive, vẫn chạy được |
+
+**Mọi đường dẫn trong tài liệu này đều tương đối với `my-geminiweb-orchestrator/`**
+(trừ khi ghi rõ `my-geminiweb-mcp/`).
+
+---
+
 ## 1. Đọc file bàn giao TRƯỚC khi làm bất cứ việc gì
 
 ```
-docs/HANDOFF.md      ← bắt buộc đọc đầu tiên, chứa toàn bộ context
-docs/FINDINGS.md     ← bằng chứng + primary source cho mọi claim
-docs/ARCHITECTURE.md ← thiết kế hệ thống
-docs/COOKIE-SETUP.md ← cách lấy cookie
+my-geminiweb-orchestrator/docs/HANDOFF.md      ← bắt buộc đọc đầu tiên, chứa toàn bộ context
+my-geminiweb-orchestrator/docs/FINDINGS.md     ← bằng chứng + primary source cho mọi claim
+my-geminiweb-orchestrator/docs/ARCHITECTURE.md ← thiết kế hệ thống
+my-geminiweb-orchestrator/docs/COOKIE-SETUP.md ← cách lấy cookie
+my-geminiweb-orchestrator/docs/COOKIE-BRIDGE.md ← cookie bridge + auto_login + file attach/download
 ```
 
-Khi user nhắn `continue`, đọc `docs/HANDOFF.md` trước, chạy `python scripts/continue.py`,
-rồi báo lại trạng thái hiện tại và hỏi bước tiếp theo nếu còn blocker.
+Khi user nhắn `continue`, đọc `my-geminiweb-orchestrator/docs/HANDOFF.md` trước, chạy
+`python my-geminiweb-orchestrator/scripts/continue.py`, rồi báo lại trạng thái hiện tại
+và hỏi bước tiếp theo nếu còn blocker.
 
 ---
 
@@ -34,7 +50,8 @@ rồi báo lại trạng thái hiện tại và hỏi bước tiếp theo nếu 
 3. **KHÔNG đọc cookie Chrome/Edge từ ngoài tiến trình** — Chrome ≥127 dùng app-bound
    encryption (prefix `v20`), đã thử và thất bại mọi cách.
 4. **KHÔNG copy cookie từ profile đang mở** — rủi ro "Evil Clone" → Google logout toàn diện.
-5. **KHÔNG commit cookie vào git.** `pools/` và `reports/` đã gitignore.
+5. **KHÔNG commit cookie, mật khẩu, token lên git.** `.gitignore` chặn `**/pools/`,
+   `**/reports/`, `**/accounts.json`, `**/cookie_files/`.
 6. **KHÔNG claim gì chưa verify.** Mọi claim load-bearing phải có primary source hoặc
    output thật từ tool.
 
@@ -44,9 +61,10 @@ rồi báo lại trạng thái hiện tại và hỏi bước tiếp theo nếu 
 
 | Thành phần | Giá trị |
 |---|---|
-| Thư viện | `gemini-webapi` (PyPI), cài sẵn vào Python 3.14.8 |
+| Thư viện (Python) | `gemini-webapi` (PyPI), cài sẵn vào Python 3.14.8 |
 | Python | 3.14.8 (`C:\Users\kimvi\AppData\Local\Python\pythoncore-3.14-64`) |
 | Repo gốc của thư viện | <https://github.com/HanaokaYuzu/Gemini-API> — 3.8k stars, cập nhật 2026-11-10 |
+| MCP SDK (.NET, hướng mới) | [`ModelContextProtocol` C# SDK](https://csharp.sdk.modelcontextprotocol.io/) |
 | MCP server sẵn có (tham khảo) | <https://github.com/vadim-a-yegorov/mcp-gemini-deep-research> |
 | `gemini_mcp.py` (hiện có) | `C:\Users\kimvi\.cursor\bin\gemini_mcp.py` — 1178 dòng, 2 pool Antigravity |
 
@@ -70,12 +88,15 @@ rồi báo lại trạng thái hiện tại và hỏi bước tiếp theo nếu 
 | `wsl` | `pools/wsl.json` | `catkingmv@gmail.com` |
 
 Tên pool khớp với pool Antigravity để `auto` routing nhất quán.
+Thư mục `pools/` nằm trong `my-geminiweb-orchestrator/pools/`.
 
 ---
 
 ## 6. Workflow chuẩn
 
 ```powershell
+cd my-geminiweb-orchestrator
+
 # Kiểm tra trạng thái cookie hiện tại
 python scripts\scan_browser_cookies.py
 
@@ -84,6 +105,9 @@ python scripts\setup_pool.py validate
 
 # Test thật 1 câu
 python scripts\setup_pool.py probe
+
+# Thu hoạch cookie live + tự đăng nhập lại nếu session chết
+python -m orchestrator.orch_cli harvest all
 ```
 
 ---

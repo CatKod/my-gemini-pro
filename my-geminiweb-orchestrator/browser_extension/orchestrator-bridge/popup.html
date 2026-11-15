@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      width: 340px;
+      margin: 0;
+      padding: 14px;
+      font: 13px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #14161a;
+      color: #e6e8ec;
+    }
+    h1 { font-size: 14px; margin: 0 0 10px; color: #8ab4f8; }
+    label { display: block; font-size: 11px; color: #9aa0a6; margin: 10px 0 4px; }
+    input[type=text] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 7px 8px;
+      border-radius: 6px;
+      border: 1px solid #333842;
+      background: #1e2127;
+      color: #e6e8ec;
+      font-size: 12px;
+    }
+    button {
+      width: 100%;
+      margin-top: 12px;
+      padding: 9px;
+      border: 0;
+      border-radius: 6px;
+      background: #1a73e8;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: default; }
+    button.ghost { background: #2a2e35; margin-top: 6px; font-weight: 500; }
+    .auto-row {
+      display: flex; align-items: center; gap: 8px;
+      margin-top: 12px; padding: 9px 10px;
+      background: #1e2127; border: 1px solid #333842; border-radius: 6px;
+    }
+    .auto-row input { margin: 0; }
+    .auto-row span { font-size: 12px; }
+    #status { margin-top: 12px; font-size: 12px; white-space: pre-wrap; }
+    .ok { color: #81c995; }
+    .err { color: #f28b82; }
+    .muted { color: #9aa0a6; font-size: 11px; margin-top: 10px; }
+    code { background:#262a31; padding:1px 4px; border-radius:3px; }
+  </style>
+</head>
+<body>
+  <h1>Orchestrator Cookie Bridge</h1>
+
+  <label for="endpoint">Endpoint orchestrator</label>
+  <input id="endpoint" type="text" value="http://127.0.0.1:9477/harvest" spellcheck="false">
+
+  <label for="token">Token (lấy từ `python -m orchestrator.cookie_bridge info`)</label>
+  <input id="token" type="text" placeholder="dán token vào đây" spellcheck="false">
+
+  <div class="auto-row">
+    <input id="auto" type="checkbox">
+    <span>Tự gửi mỗi khi mở tab Gemini</span>
+  </div>
+
+  <button id="send">Gửi cookie Gemini</button>
+  <button id="save" class="ghost">Lưu cấu hình</button>
+
+  <div id="status">Sẵn sàng. Mở tab <b>gemini.google.com</b> đã đăng nhập rồi bấm "Gửi cookie".</div>
+
+  <div class="muted">
+    Extension chỉ đọc cookie của <code>.google.com</code> và chỉ gửi tới
+    <code>127.0.0.1</code> — không gửi đi đâu khác.
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

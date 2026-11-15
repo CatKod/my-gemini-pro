@@ -64,40 +64,22 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator import credentials
+from orchestrator import paths
 
 FORMAT_VERSION = 1
 
 #: File registry.
 REGISTRY_FILENAME = "accounts.json"
 
-#: Thư mục gốc data của orchestrator.
-def _data_root() -> Path:
-    """Thư mục chứa `pools/`.
-
-    - `GEMINI_DATA_DIR` (explicit, ưu tiên cao nhất)
-    - Source → `<repo>/`
-    - `.exe` → cwd hoặc cây thư mục lên trên, else `%LOCALAPPDATA%\\Orchestrator`
-    """
-    env = os.environ.get("GEMINI_DATA_DIR")
-    if env:
-        return Path(env)
-
-    repo = Path(__file__).resolve().parent.parent
-    if not getattr(__import__("sys"), "frozen", False):
-        return repo
-
-    cwd = Path.cwd()
-    for cand in [cwd, *cwd.parents][:5]:
-        if (cand / ".git").exists() or (cand / "pools").is_dir():
-            return cand
-    local = Path(os.environ.get("LOCALAPPDATA", "")) / "Orchestrator"
-    local.mkdir(parents=True, exist_ok=True)
-    return local
-
-
-DATA_ROOT = _data_root()
-POOLS_DIR = DATA_ROOT / "pools"
-REGISTRY_PATH = DATA_ROOT / REGISTRY_FILENAME
+#: Thư mục gốc data + các đường dẫn con.
+#:
+#: TRƯỚC ĐÂY module này tự dò data root (`_data_root()`), còn `cookie_sync`
+#: dùng cách khác → split-brain khi chạy `.exe` (GUI ghi vào
+#: `%LOCALAPPDATA%\\Orchestrator\\pools\\`, dashboard đọc `<repo>\\pools\\`).
+#: GIỜ: dùng chung `orchestrator.paths` cho mọi module.
+DATA_ROOT = paths.DATA_ROOT
+POOLS_DIR = paths.POOLS_DIR
+REGISTRY_PATH = paths.ACCOUNTS_FILE
 
 #: Mapping account → pool cho 2 tài khoản Antigravity có sẵn.
 DEFAULT_POOLS = {
@@ -208,6 +190,65 @@ def set_password(account: str, password: str) -> dict[str, Any]:
     data["accounts"][key] = entry
     _write(data)
     return _public(key, entry)
+
+
+def adopt_cookie_json(
+    account: str,
+    raw_text: str,
+    *,
+    email: str | None = None,
+    pool: str | None = None,
+) -> dict[str, Any]:
+    """Dán cookie JSON (từ clipboard) cho 1 account — 1 lệnh làm hết.
+
+    Đây là đường nhập cookie **không cần file tạm**: user copy JSON từ
+    Cookie-Editor → paste vào popup → bấm "Lưu".
+
+    Khác với `cookie_sync.adopt()` (file) ở chỗ:
+      - Input là **chuỗi JSON dán**, không phải path.
+      - **Không xoá** profile Chrome của account nếu đã tồn tại (xoá sẽ phá
+        DBSC key của session đang chạy).
+
+    Nếu account chưa có trong registry → tự tạo (email lấy từ tham số, hoặc
+    suy ra từ tên account).
+    """
+    from orchestrator import cookie_sync
+
+    key = _key(account)
+    info = get(key)
+    if info is None:
+        info = add_account(
+            email or f"{key}@gmail.com",
+            account=key,
+            pool=pool,
+            auth="oauth",
+        )
+
+    resolved_email = email or info.get("email")
+    resolved_pool = pool or info.get("pool") or key
+
+    try:
+        out = cookie_sync.adopt_json(
+            key,
+            raw_text,
+            pool_name=resolved_pool,
+            account_email=resolved_email,
+        )
+    except ValueError as e:
+        note_error(key, str(e))
+        raise
+
+    if out.get("signed_in"):
+        note_ok(key)
+    else:
+        note_error(
+            key,
+            "cookie đã lưu nhưng trang Gemini vẫn chưa đăng nhập — "
+            "cookie có thể đã hết hạn hoặc thiếu cookie khác.",
+        )
+    out["account"] = key
+    out["pool"] = resolved_pool
+    return out
 
 
 def get(account: str) -> dict[str, Any] | None:

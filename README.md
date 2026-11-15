@@ -2,59 +2,51 @@
 
 Hệ thống **điều khiển Gemini Deep Research thông qua gói Google AI Pro (Gemini Advanced) đã trả phí** — không dùng AI Studio Interactions API (vốn tính phí pay-as-you-go riêng).
 
-## Mục tiêu
+Repo nay chứa **2 project độc lập** cùng tồn tại:
 
-| Hệ thống | Đi đường nào | Được tính vào đâu |
-|---|---|---|
-| `agy` / Antigravity CLI | OAuth Antigravity | Quota Antigravity (Windows + WSL) |
-| AI Studio Interactions API | `x-goog-api-key` | **Tiền riêng** ❌ — đã loại |
-| **`gemini_webapi`** (repo này) | Cookie `gemini.google.com` | **Gói Gemini Advanced / AI Pro của bạn** ✅ |
+| Thư mục | Ngôn ngữ | Vai trò | Trạng thái |
+|---|---|---|---|
+| `my-geminiweb-mcp/` | C# / .NET | **MCP Server App** — hướng mới (SDK `ModelContextProtocol` chính thức, đóng gói NuGet) | 🆕 mới tạo |
+| `my-geminiweb-orchestrator/` | Python | Orchestrator CDP/cookie + GUI + CLI + MCP server (Python) | 📦 đã archive, vẫn chạy được |
 
-## Trạng thái hiện tại
+---
 
-- [x] Xác minh `ChatCmd` (`int04/ChatCmd`) **không dùng được** cho Gemini — repo chỉ có bridge ChatGPT, 0 tham chiếu Gemini
-- [x] Xác định giải pháp: `HanaokaYuzu/Gemini-API` (`gemini_webapi`), 3.8k stars, cập nhật 2026-11-10
-- [x] Quét cookie: **cả 2 profile Chrome đều đã đăng nhập Gemini** (`mmeo44244`, `catkingmv`)
-- [x] Export cookie cho pool `windows` (`mmeo44244@gmail.com`) → `pools/windows.json`
-- [x] Viết `tools/gemini_pool.py` + `tools/gemini_dr_mcp.py` (pool kép + auto-routing)
-- [x] Tích hợp vào `gemini_mcp.py` (thêm `gemini_dr_*` tools)
-- [x] Test end-to-end: Deep Research chạy thật, trả report + sources
-- [x] **Orchestrator** — chạy task dài không chặn agent (Deep Research / chat / canvas / Antigravity)
-- [x] Tự động tạo hồ sơ Chrome cho acc Google mới (song song hoá pool)
-- [x] GUI dashboard (Tkinter) + đóng gói `.exe`
-- [ ] Export cookie cho pool `wsl` (`catkingmv@gmail.com`)
-- [ ] Bật `gemini-dr` + `orchestrator` MCP server trong Cursor (đã ghi vào `~/.cursor/mcp.json`, cần reload)
+## 1. `my-geminiweb-mcp/` — MCP Server App (hướng mới)
 
-## Orchestrator — task dài không chặn agent
-
-Vấn đề: gọi Gemini Deep Research / Antigravity trực tiếp = agent phải chờ
-30-60 phút, và bạn không biết Gemini đang làm gì.
-
-Giải pháp: tách "chạy" khỏi "chờ". Job chạy ở process con độc lập, ghi
-tiến độ vào SQLite; agent làm việc khác rồi quay lại lấy kết quả.
-
-```powershell
-# Submit -> nhận job_id ngay, KHÔNG chặn
-python -m orchestrator.orch_cli submit deep_research "So sánh X vs Y năm 2026" --pool windows
-
-# Chạy NỀN -> Cursor tự đánh thức bạn khi job xong
-python -m orchestrator.orch_cli watch j_xxxxx
-
-# GUI (tuỳ chọn)
-python -m orchestrator.gui
-```
-
-Xem `docs/ORCHESTRATOR-USAGE.md`.
-
-## Cấu trúc
+Project .NET tạo bằng template **MCP Server App** của Visual Studio, dùng SDK C# chính thức [`ModelContextProtocol`](https://csharp.sdk.modelcontextprotocol.io/).
 
 ```
-my-gemini-pro/
-├── README.md
+my-geminiweb-mcp/
+└── my-geminiweb-mcp/
+    ├── Program.cs                     ← host + stdio transport + đăng ký tools
+    ├── Tools/RandomNumberTools.cs     ← tool mẫu (sẽ thay bằng tool Gemini)
+    ├── .mcp/server.json               ← manifest publish lên NuGet
+    ├── my-geminiweb-mcp.csproj
+    └── my-geminiweb-mcp.slnx
+```
+
+**Vì sao hướng mới:** bản Python hiện tại phải tự quản lý CDP, cookie, profile
+Chrome, retry, watchdog, quarantine — nhiều bề mặt lỗi. Bản .NET chính thức
+được maintain cùng SDK MCP, đóng gói self-contained, có sẵn khung NuGet/config
+input, và chạy được trong Visual Studio / VS Code **mà không cần cài runtime**.
+
+> Trạng thái: mới tạo, còn tool mẫu `get_random_number`. Xem
+> [`docs/MCP-SERVER-APP-PLAN.md`](my-geminiweb-orchestrator/docs/MCP-SERVER-APP-PLAN.md)
+> để biết kế hoạch chi tiết.
+
+---
+
+## 2. `my-geminiweb-orchestrator/` — Orchestrator Python (đã archive)
+
+Toàn bộ hệ thống Python cũ, **giữ nguyên khả năng chạy**, chỉ đổi vị trí thư mục.
+
+```
+my-geminiweb-orchestrator/
 ├── docs/
 │   ├── HANDOFF.md              ← bàn giao cho phiên mới (đọc file này trước)
 │   ├── ARCHITECTURE.md
 │   ├── FINDINGS.md             ← kết quả nghiên cứu + nguồn
+│   ├── COOKIE-BRIDGE.md        ← cookie bridge + auto_login + file attach/download
 │   ├── COOKIE-SETUP.md
 │   ├── ORCHESTRATOR.md         ← kiến trúc orchestrator
 │   └── ORCHESTRATOR-USAGE.md   ← hướng dẫn dùng
@@ -63,13 +55,15 @@ my-gemini-pro/
 │   ├── dispatch.py             ← submit / spawn / wait / cancel
 │   ├── orch_mcp.py             ← MCP server (cổng gọi của agent)
 │   ├── orch_cli.py             ← CLI (dùng cho shell background)
-│   ├── gui.py                  ← Tkinter dashboard
+│   ├── gui.py / ui.py / dashboard.py / board.py
+│   ├── paths.py                ← nguồn sự thật duy nhất cho đường dẫn dữ liệu
+│   ├── cdp.py / auto_login.py / harvest.py / cookie_sync.py / cookie_bridge.py
+│   ├── gemini_files.py         ← đọc + tải file Gemini sinh ra (.xlsx/.pdf/…)
 │   ├── chrome_profile.py       ← tạo hồ sơ Chrome cho multi-account
 │   ├── selftest.py             ← smoke test
 │   ├── orchestrator.spec       ← PyInstaller spec (.exe)
-│   ├── skills/orchestrator/SKILL.md
 │   └── runners/
-│       ├── gemini.py           ← Deep Research / chat / canvas
+│       ├── gemini.py           ← Deep Research / chat / canvas (+ attach file)
 │       └── agy.py              ← Antigravity CLI (NDJSON stream)
 ├── tools/
 │   ├── gemini_dr_mcp.py        ← MCP server Deep Research
@@ -81,60 +75,45 @@ my-gemini-pro/
 │   └── build_exe.py            ← đóng gói .exe
 ├── research/
 │   └── chatcmd-analysis.md     ← phân tích int04/ChatCmd (đã loại)
+├── browser_extension/          ← extension Chrome cấp cookie (cookie bridge)
 ├── pools/                      ← cookie export (gitignore, KHÔNG commit)
-└── .cursor/rules/
-    └── gemini-pro.mdc          ← rule tự động cho phiên mới
+├── reports/                    ← output job + file Gemini sinh ra (gitignore)
+├── accounts.json               ← registry tài khoản (gitignore, KHÔNG commit)
+└── cookie_files/               ← bản sao cookie gốc (gitignore, KHÔNG commit)
 ```
 
-## Bắt đầu nhanh
+### Chạy
 
 ```powershell
+cd my-geminiweb-orchestrator
+
 # 0. Phiên mới: xem trạng thái hiện tại
 python scripts\continue.py
 
-# 1. Quét trạng thái cookie hiện tại
-python scripts\scan_browser_cookies.py
+# 1. Orchestrator — submit job (KHÔNG chặn agent)
+python -m orchestrator.orch_cli submit deep_research "So sánh X vs Y năm 2026" --pool windows
+python -m orchestrator.orch_cli watch j_xxxxx
 
-# 2. Sau khi export cookie (Cookie-Editor):
-python scripts\setup_pool.py setup --export <file.json> --name windows --account mmeo44244@gmail.com
-python scripts\setup_pool.py validate
-python scripts\setup_pool.py probe
+# 2. GUI dashboard
+python -m orchestrator.gui
 
-# 3. Test một deep research thật (đóng Chrome trước để tránh evil-clone)
-python -c "import asyncio,sys; sys.path.insert(0,'tools'); from gemini_dr_mcp import gemini_dr_research; print(asyncio.run(gemini_dr_research('Rust vs Go: quan ly bo nho')))"
+# 3. Chat kèm file đính kèm, file Gemini sinh ra được tải về reports/downloads/
+python -m orchestrator.orch_cli submit chat "Đọc file đính kèm" --pool acc --attach file.py
 ```
 
-## MCP tools
+Xem `my-geminiweb-orchestrator/docs/ORCHESTRATOR-USAGE.md`.
 
-Server `gemini-dr` (`tools/gemini_dr_mcp.py`) + các tool `gemini_dr_*` đã gắn
-thêm vào server `gemini` (`~/.cursor/bin/gemini_mcp.py`):
+---
 
-| Tool | Việc |
-|---|---|
-| `gemini_dr_research(query, pool, timeout, model)` | Chạy full research → report markdown + sources |
-| `gemini_dr_plan(query, pool, model)` | Chỉ xem plan, **chưa** chạy (để duyệt scope) |
-| `gemini_dr_collect(cid, pool, timeout)` | Thu report của task đang chạy (dùng khi research bị timeout) |
-| `gemini_dr_quota(pool)` | Headroom 5h + weekly của mỗi pool |
-| `gemini_dr_account()` | Email ↔ pool mapping |
+## Nguyên tắc bất di bất dịch
 
-### ⚠️ Model bắt buộc
+1. **KHÔNG dùng AI Studio Interactions API** — nó tính phí riêng, không trừ vào gói AI Pro.
+2. **KHÔNG đọc cookie Chrome/Edge từ ngoài tiến trình** — Chrome ≥127 dùng app-bound encryption.
+3. **KHÔNG copy cookie từ profile đang mở** — rủi ro "Evil Clone" → Google logout toàn diện.
+4. **KHÔNG commit cookie / mật khẩu / token lên git.** `.gitignore` chặn `pools/`, `reports/`, `accounts.json`, `cookie_files/`.
+5. **KHÔNG claim gì chưa verify** — mọi claim load-bearing phải có primary source hoặc output thật từ tool.
 
-Deep Research **không** chạy trên mọi model. Model mà account để mặc định thường
-*từ chối* với câu "tôi chỉ là mô hình ngôn ngữ" thay vì trả plan. Bridge tự dò
-qua các model ứng viên và cache model đã biết vào `pools/<name>.json` (`dr_model`).
-
-Xem upstream issue: <https://github.com/HanaokaYuzu/Gemini-API/issues/359>
-
-## Về "nhắn continue ở phiên khác"
-
-Repo được thiết kế để phiên mới nạp lại context chỉ bằng 1 từ khoá:
-
-1. **`docs/HANDOFF.md`** — toàn bộ context, bằng chứng, kế hoạch, việc chưa làm
-2. **`.cursor/rules/gemini-pro.mdc`** — rule tự động: đọc HANDOFF.md trước, không dùng AI Studio API, không đọc cookie ngoài Chrome, không commit cookie
-3. **`scripts/continue.py`** — in trạng thái hiện tại + bước tiếp theo
-4. **agentmemory** — đã lưu quyết định kiến trúc (project `my-gemini-pro`, agent `cursor`)
-
-Mở repo này trong Cursor → nhắn `continue` → agent sẽ đọc rule, đọc HANDOFF.md, chạy `scripts/continue.py` và báo đúng trạng thái.
+---
 
 ## Rủi ro đã biết
 
@@ -142,8 +121,9 @@ Mở repo này trong Cursor → nhắn `continue` → agent sẽ đọc rule, đ
 |---|---|---|
 | "Evil Clone" logout — Google kill-switch nếu 2 session trùng | ⚠️ Cao | Chrome profile riêng cho automation, không mở song song profile chính |
 | Vi phạm ToS Google | ⚠️ | Chấp nhận rủi ro, dùng tài khoản phụ |
-| Cookie `v20` app-bound encryption (Chrome ≥127) | 🟡 | Bắt buộc export từ bên trong Chrome, không đọc DB ngoài được |
+| Cookie `v20` app-bound encryption (Chrome ≥127) | 🟡 | Phải lấy cookie từ bên trong Chrome (CDP trên profile riêng, hoặc extension) |
 | Google đổi endpoint `batchexecute` | 🟡 | `gemini_webapi` cập nhật thường xuyên — theo dõi upstream |
+| `account_status=1016` giả (cookie stale) | 🟡 | `cdp.get_cookies()` ưu tiên domain `.google.com`; `harvest all` tự đăng nhập lại |
 
 ## License
 

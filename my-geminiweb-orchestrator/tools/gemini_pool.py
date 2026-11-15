@@ -41,6 +41,11 @@ def _resolve_dir(env_name: str, name: str) -> Path:
     3. `.exe` → tìm `<name>` bằng cách đi **lên cây thư mục** từ cwd (tối đa 5
        cấp) — cho phép chạy `.exe` từ bất kỳ đâu trong repo. Nếu không có,
        fallback `%LOCALAPPDATA%\\Orchestrator\\<name>`.
+
+    LƯU Ý: từ 2026-11-14, `orchestrator.paths` là nguồn sự thật duy nhất cho
+    data root — mọi module (kể cả `tools/gemini_pool.py`) dùng chung để tránh
+    split-brain (GUI ghi pool vào `%LOCALAPPDATA%` còn dashboard đọc `<repo>`).
+    Hàm này giữ lại như fallback cho trường hợp chạy độc lập ngoài repo.
     """
     env = os.environ.get(env_name)
     if env:
@@ -48,6 +53,18 @@ def _resolve_dir(env_name: str, name: str) -> Path:
 
     if not getattr(sys, "frozen", False):
         return REPO_ROOT / name
+
+    # Dùng `orchestrator.paths` nếu import được (bản .exe đóng gói có sẵn).
+    try:
+        sys.path.insert(0, str(REPO_ROOT))
+        from orchestrator import paths
+
+        if name == "pools":
+            return paths.POOLS_DIR
+        if name == "reports":
+            return paths.REPORTS_DIR
+    except Exception:
+        pass
 
     cwd = Path.cwd()
     for candidate in [cwd, *cwd.parents][:5]:
@@ -71,6 +88,39 @@ OPTIONAL = "__Secure-1PSIDTS"
 
 # Cache TTL cho snapshot quota — cùng TTL với `gemini_mcp.py` (300s).
 QUOTA_CACHE_TTL = 300.0
+
+
+def _purge_gemini_cache(psid: str | None = None) -> None:
+    """Xoá cache cookie cũ của `gemini_webapi` (best-effort, không raise).
+
+    `gemini_webapi` cache cookie tại `%TEMP%\\gemini_webapi\\.cached_cookies_*.json`
+    và **thử cache trước** cookie user cung cấp (`get_access_token.py`, Phase 1).
+    Cache cũ ghi đè `1PSIDTS` mới → session báo `UNAUTHENTICATED` dù pool file
+    hoàn toàn đúng. Xem `orchestrator/cookie_sync.py::purge_gemini_cache`.
+
+    Verify 2026-11-14 (`reports/_shadow_test.py`):
+        cache có 1PSIDTS cũ → UNAUTHENTICATED
+        xoá cache            → AVAILABLE
+    """
+    try:
+        import os
+        import tempfile
+        from pathlib import Path
+
+        d = Path(
+            os.environ.get("GEMINI_COOKIE_PATH")
+            or (Path(tempfile.gettempdir()) / "gemini_webapi")
+        )
+        if not d.is_dir():
+            return
+        pattern = f".cached_cookies_{psid}.json" if psid else ".cached_cookies_*.json"
+        for f in d.glob(pattern):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 # Model nào hỗ trợ Deep Research.
 #
@@ -234,6 +284,14 @@ async def _fetch_quota(pool: Pool, force: bool = False) -> dict[str, Any]:
         and now - pool._quota_at < QUOTA_CACHE_TTL
     ):
         return pool._quota
+
+    # Xoá cache cookie cũ của `gemini_webapi` — nó che (shadow) `1PSIDTS`
+    # mới trong pool file và làm quota đọc ra `UNAUTHENTICATED` giả.
+    #
+    # Verify 2026-11-14 (`reports/_shadow_test.py`):
+    #   cache có 1PSIDTS cũ → UNAUTHENTICATED
+    #   xoá cache            → AVAILABLE
+    _purge_gemini_cache(pool.cookies.get(REQUIRED))
 
     from gemini_webapi import GeminiClient
 

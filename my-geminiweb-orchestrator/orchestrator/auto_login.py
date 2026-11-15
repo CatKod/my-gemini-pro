@@ -175,6 +175,37 @@ CONSENT_SCRIPT = r"""
 })()
 """
 
+#: Script accept Terms of Service của Gemini (màn hình "Lưu ý" + nút
+#: "Tôi hiểu" / "I understand").
+#:
+#: Tài khoản MỚI (chưa từng dùng Gemini) bị chặn bằng `TOS_PENDING` cho tới
+#: khi user bấm nút đồng ý. Đây là **hành động của chính user** (chấp nhận
+#: điều khoản dịch vụ), không phải bypass.
+#:
+#: Verify (2026-11-14, account `reigin483`): sau khi bấm "Tôi hiểu" →
+#: `account_status` chuyển từ `TOS_PENDING` sang `AVAILABLE`.
+#:
+#: Lưu ý: so khớp bằng **regex ASCII-safe** (`/^Tôi hiểu$/` vẫn phụ thuộc
+#: Unicode normalization của chuỗi gửi qua CDP). Ta dùng `normalize('NFC')`
+#: ở cả 2 vế + so khớp `textContent` (nút Material có thể đặt text ở child).
+TOS_SCRIPT = r"""
+(() => {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim()
+                            .normalize('NFC');
+  const re = /^(Tôi hiểu|Đã hiểu|I understand|Got it)$/u;
+  const en = /^I understand$/;
+  for (const btn of document.querySelectorAll('button, [role=button]')) {
+    const t = norm(btn.innerText) || norm(btn.textContent);
+    if (!t) continue;
+    if (re.test(t) || en.test(t)) {
+      btn.click();
+      return t;
+    }
+  }
+  return null;
+})()
+"""
+
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -270,6 +301,20 @@ def _dismiss_consent(cdp: Any, session_id: str) -> str | None:
     """Bấm "Not now" nếu màn hình consent/passkey xuất hiện."""
     try:
         val = cdp.evaluate(session_id, CONSENT_SCRIPT)
+        return val if isinstance(val, str) else None
+    except Exception:
+        return None
+
+
+def _accept_tos(cdp: Any, session_id: str) -> str | None:
+    """Bấm nút đồng ý Điều khoản ("Tôi hiểu" / "I understand") nếu xuất hiện.
+
+    Tài khoản mới bị Gemini chặn với `TOS_PENDING` cho tới khi đồng ý điều
+    khoản. Không có bước này thì account dù đăng nhập đúng vẫn không dùng
+    được API.
+    """
+    try:
+        val = cdp.evaluate(session_id, TOS_SCRIPT)
         return val if isinstance(val, str) else None
     except Exception:
         return None
@@ -384,6 +429,14 @@ def auto_login(
         cdp.call("Page.navigate", {"url": SIGNIN_URL}, session_id=sid)
         time.sleep(wait_ms / 1000)
 
+        # Chụp cookie 1PSID **trước** khi điền form. Nếu profile đã có cookie
+        # cũ (đã chết), ta cần biết để phân biệt "cookie mới" với "cookie cũ"
+        # khi kiểm tra kết quả. Xem bước 4.
+        try:
+            cookies_before = cdp.get_cookies()
+        except Exception:
+            cookies_before = {}
+
         # -- Bước 1: email -------------------------------------------------
         # Chờ ô email xuất hiện (không phải PASSWORD_READY — ô email chưa
         # được điền nên màn hình vẫn là bước 1).
@@ -398,6 +451,17 @@ def auto_login(
             if st == "CHALLENGE":
                 return _human(
                     steps, session, "Google yêu cầu xác thực ở bước nhập email", keep_open
+                )
+            if st == "LOGGED_IN" and cookies_before.get(cookie_sync.REQUIRED):
+                # **Profile đã đăng nhập sẵn** (Google redirect thẳng khỏi
+                # trang signin). Không cần điền form — nhảy thẳng sang bước
+                # verify (TOS + sync).
+                #
+                # Verify (2026-11-14): `reigin483` đã đăng nhập ở lần trước
+                # → `account login` lần 2 báo "không thấy ô nhập email".
+                steps.append("profile đã đăng nhập sẵn — bỏ qua form đăng nhập")
+                return _verify_and_finish(
+                    account, info, email, session, cdp, sid, steps, keep_open
                 )
             return _unknown(steps, f"không thấy ô nhập email ({st})")
 
@@ -456,12 +520,24 @@ def auto_login(
         if st == "CHALLENGE":
             return _human(steps, session, "Google yêu cầu xác thực 2 bước", keep_open)
 
-        # Chờ thêm cho cookie 1PSID xuất hiện.
-        deadline = time.time() + 20
+        # Chờ thêm cho cookie 1PSID **MỚI** xuất hiện.
+        #
+        # Bẫy đã gặp (2026-11-14): profile Chrome đã có sẵn cookie 1PSID **cũ
+        # đã chết** từ lần đăng nhập trước → vòng lặp thấy cookie ngay lập tức
+        # → báo "đăng nhập thành công" dù thực tế trang Gemini vẫn hiện
+        # "Đăng nhập" và session vẫn `UNAUTHENTICATED`.
+        #
+        # Sửa: so sánh với cookie 1PSID **trước khi** điền form; chỉ coi là
+        # thành công khi cookie đã **đổi** hoặc trang Gemini xác nhận đăng nhập.
+        psid_before = cookies_before.get(cookie_sync.REQUIRED)
+        deadline = time.time() + 25
         cookies: dict[str, str] = {}
+        psid_changed = False
         while time.time() < deadline:
             cookies = cdp.get_cookies()
-            if cookie_sync.REQUIRED in cookies:
+            psid_now = cookies.get(cookie_sync.REQUIRED)
+            if psid_now and psid_now != psid_before:
+                psid_changed = True
                 break
             _dismiss_consent(cdp, sid)
             time.sleep(1.0)
@@ -473,34 +549,19 @@ def auto_login(
                 "bước consent/challenge. Kiểm tra cửa sổ Chrome.",
             )
 
-        # Đóng Chrome graceful để flush cookie vào profile.
-        try:
-            cdp.close_browser()
-        except Exception:
-            pass
-
-        pool = info.get("pool") or account
-        sync_result = cookie_sync.sync(
-            account, pool_name=pool, account_email=email
+        # -- Bước 5: verify + sync ------------------------------------------
+        return _verify_and_finish(
+            account,
+            info,
+            email,
+            session,
+            cdp,
+            sid,
+            steps,
+            keep_open,
+            psid_changed=psid_changed,
+            cookies=cookies,
         )
-        if sync_result.get("ok"):
-            account_registry.note_ok(account)
-        else:
-            account_registry.note_error(
-                account, str(sync_result.get("error") or "sync thất bại")
-            )
-
-        return {
-            "ok": bool(sync_result.get("ok")),
-            "state": "ok",
-            "reason": "đăng nhập thành công",
-            "detail": sync_result.get("warning") or "",
-            "steps": steps,
-            "pool": pool,
-            "session_ok": sync_result.get("session_ok"),
-            "account_status": sync_result.get("account_status"),
-            "cookies": sync_result.get("cookies"),
-        }
     except Exception as e:
         return _fail(steps, "failed", f"{type(e).__name__}: {e}")
     finally:
@@ -509,6 +570,121 @@ def auto_login(
                 session.close()
             except Exception:
                 pass
+
+
+def _verify_and_finish(
+    account: str,
+    info: dict[str, Any],
+    email: str,
+    session: Any,
+    cdp: Any,
+    sid: str,
+    steps: list[str],
+    keep_open: bool,
+    *,
+    psid_changed: bool = False,
+    cookies: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Sync cookie → accept TOS nếu cần → probe session → trả kết quả.
+
+    Dùng chung cho 2 đường:
+      - đăng nhập mới qua form (đã có cookie mới)
+      - profile **đã đăng nhập sẵn** (bỏ qua form)
+
+    Thứ tự quan trọng: **Chrome phải còn mở** khi accept TOS (cần bấm nút
+    trên trang), nên ta sync → xử lý TOS → sync lại → mới đóng Chrome.
+    """
+    if cookies is None:
+        try:
+            cookies = cdp.get_cookies()
+        except Exception:
+            cookies = {}
+
+    pool = info.get("pool") or account
+    sync_result = cookie_sync.sync(
+        account, pool_name=pool, account_email=email
+    )
+
+    # -- Accept Terms of Service ------------------------------------------
+    #
+    # Tài khoản mới bị Gemini chặn `TOS_PENDING` cho tới khi đồng ý điều
+    # khoản. Mở trang Gemini → bấm "Tôi hiểu" / "I understand" → sync lại.
+    #
+    # Verify (2026-11-14, account `reigin483`): trước khi có bước này →
+    # `TOS_PENDING`; sau khi bấm "Tôi hiểu" → `AVAILABLE`.
+    if sync_result.get("account_status") == "TOS_PENDING":
+        tos_clicked = None
+        try:
+            cdp.call("Page.navigate", {"url": cookie_sync.GEMINI_URL}, session_id=sid)
+            time.sleep(6)
+            for _ in range(5):
+                tos_clicked = _accept_tos(cdp, sid)
+                if tos_clicked:
+                    steps.append(f"đã đồng ý điều khoản: bấm '{tos_clicked}'")
+                    time.sleep(3)
+                    break
+                _dismiss_consent(cdp, sid)
+                time.sleep(1.5)
+            # Sync lại sau khi đồng ý (cookie 1PSIDTS có thể vừa rotate).
+            if tos_clicked:
+                sync_result = cookie_sync.sync(
+                    account, pool_name=pool, account_email=email
+                )
+        except Exception:
+            pass
+
+    # Đóng Chrome graceful để flush cookie vào profile.
+    try:
+        cdp.close_browser()
+    except Exception:
+        pass
+
+    # **Xác minh thật**: session phải còn sống (gọi API thật), không chỉ
+    # "có cookie". Cookie cũ vẫn còn trong profile nên kiểm tra bằng
+    # `account_status` mới đáng tin.
+    session_ok = bool(sync_result.get("session_ok"))
+    if not session_ok:
+        account_registry.note_error(
+            account,
+            "đăng nhập xong nhưng session vẫn không hợp lệ "
+            f"(account_status={sync_result.get('account_status')})",
+        )
+        return {
+            "ok": False,
+            "state": "needs_human",
+            "reason": (
+                "Đã điền form nhưng Google vẫn chưa cấp session hợp lệ "
+                f"(account_status={sync_result.get('account_status')}). "
+                "Có thể còn màn hình consent/2FA, hoặc Google đã khoá "
+                "tài khoản."
+            ),
+            "hint": (
+                "Kiểm tra cửa sổ Chrome: đăng nhập xong hãy mở "
+                "https://gemini.google.com/app và xem có hiện 'Thư viện' "
+                "không. Nếu có → bấm 'Đồng bộ cookie'."
+            ),
+            "steps": steps,
+            "pool": pool,
+            "session_ok": False,
+            "account_status": sync_result.get("account_status"),
+            "cookies": sync_result.get("cookies"),
+            "psid_changed": psid_changed,
+        }
+
+    account_registry.note_ok(account)
+
+    return {
+        "ok": True,
+        "state": "ok",
+        "reason": "đăng nhập thành công",
+        "detail": sync_result.get("warning") or "",
+        "steps": steps,
+        "pool": pool,
+        "session_ok": sync_result.get("session_ok"),
+        "account_status": sync_result.get("account_status"),
+        "psid_changed": psid_changed,
+        "cookies": sync_result.get("cookies"),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -123,15 +123,65 @@ class CDPClient:
 
     # -- API tiện ích -----------------------------------------------------
 
-    def get_cookies(self) -> dict[str, str]:
-        """Đọc cookie mọi domain → `{name: value}`."""
+    #: Domain ưu tiên khi cùng tên cookie tồn tại ở nhiều domain.
+    #:
+    #: Cookie `__Secure-1PSIDTS` của Google được set cho `.google.com` VÀ
+    #: `.youtube.com`. Bản `.youtube.com` thường **cũ hơn** (không được
+    #: rotate khi bạn vào Gemini). `Storage.getCookies` trả về theo thứ tự
+    #: không bảo đảm → `setdefault` (first-wins) có thể lấy nhầm bản stale →
+    #: server trả `UNAUTHENTICATED` (1016) dù session thật vẫn sống.
+    #:
+    #: Verify (2026-11-14, account `kimperiod0126`):
+    #:   `.youtube.com` → `sidts-CjQBnJZzaqMYoVZ...`  (stale  → 1016)
+    #:   `.google.com`  → `sidts-CjYBnJZzaq6z_iZn...` (fresh  → 1000 AVAILABLE)
+    _COOKIE_DOMAIN_PRIORITY = (
+        ".google.com",
+        ".google.com.vn",
+        ".google.com.tr",
+        ".youtube.com",
+        "",
+    )
+
+    def get_cookies(self, domain: str | None = None) -> dict[str, str]:
+        """Đọc cookie mọi domain → `{name: value}`.
+
+        Args:
+            domain: nếu cho, chỉ lấy cookie của domain này (vd `.google.com`).
+
+        Ghi chú: cùng 1 tên cookie có thể tồn tại ở nhiều domain. Ta **ưu tiên
+        domain Google** vì bản `.youtube.com` của `__Secure-1PSIDTS` hay cũ hơn
+        (xem `_COOKIE_DOMAIN_PRIORITY`).
+        """
         res = self.call("Storage.getCookies")
-        out: dict[str, str] = {}
+        buckets: dict[str, list[tuple[int, str]]] = {}
         for c in res.get("cookies") or []:
             name, value = c.get("name"), c.get("value")
-            if isinstance(name, str) and isinstance(value, str):
-                out.setdefault(name, value)
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            dom = (c.get("domain") or "").lstrip(".")
+            if domain:
+                if dom != domain.lstrip("."):
+                    continue
+                buckets.setdefault(name, []).append((0, value))
+                continue
+            prio = self._domain_priority(dom)
+            buckets.setdefault(name, []).append((prio, value))
+
+        out: dict[str, str] = {}
+        for name, vals in buckets.items():
+            vals.sort(key=lambda t: t[0])
+            out[name] = vals[0][1]
         return out
+
+    @classmethod
+    def _domain_priority(cls, domain: str) -> int:
+        """Số thứ tự ưu tiên của domain (nhỏ hơn = ưu tiên cao hơn)."""
+        if not domain:
+            return len(cls._COOKIE_DOMAIN_PRIORITY)
+        for i, d in enumerate(cls._COOKIE_DOMAIN_PRIORITY):
+            if domain == d.lstrip("."):
+                return i
+        return len(cls._COOKIE_DOMAIN_PRIORITY)
 
     def set_cookie(
         self,

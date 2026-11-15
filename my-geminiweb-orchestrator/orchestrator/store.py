@@ -278,6 +278,106 @@ def heartbeat(job_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reaper — dọn job mồ côi
+# ---------------------------------------------------------------------------
+
+#: Job QUEUED/RUNNING mà tiến trình đã chết → đánh dấu FAILED.
+#: Ngưỡng: đợi 60s trước khi kết luận, để runner còn thời gian spawn.
+ORPHAN_GRACE_SEC = 60.0
+
+
+def _pid_alive(pid: int) -> bool:
+    """Tiến trình còn sống không (Windows + POSIX)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return code.value == 259  # STILL_ACTIVE
+                return True
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            return True  # không chắc → giả định còn sống (an toàn)
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+    except Exception:
+        return True
+
+
+def reap_orphans(*, grace: float = ORPHAN_GRACE_SEC) -> list[str]:
+    """Đánh dấu FAILED các job mà tiến trình runner đã chết.
+
+    Vì sao cần: runner là process con **detached**. Nếu nó bị kill cứng
+    (taskkill, crash máy, OOM), không ai cập nhật state → job kẹt ở
+    QUEUED/RUNNING **vĩnh viễn**. Dashboard sẽ hiện "đang chạy" ma, và
+    `orch_list(state="active")` trả về job không bao giờ xong.
+
+    Thực tế đã gặp: 4 job chat kẹt từ 2-9 tiếng.
+
+    Args:
+        grace: số giây chờ trước khi kết luận tiến trình chết (tránh race
+            với lúc runner vừa spawn, chưa kịp ghi pid).
+
+    Returns:
+        danh sách job id đã được dọn.
+    """
+    now = time.time()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT id, pid, created_at, started_at, heartbeat_at
+               FROM jobs WHERE state IN (?, ?)""",
+            (QUEUED, RUNNING),
+        ).fetchall()
+
+        cleaned: list[str] = []
+        for row in rows:
+            jid = row["id"]
+            pid = row["pid"] or 0
+            # Job chưa có pid → runner chưa kịp spawn, hoặc spawn thất bại.
+            ref_ts = row["started_at"] or row["created_at"] or 0
+            age = now - ref_ts
+            if pid and _pid_alive(int(pid)):
+                continue
+            if age < grace:
+                continue
+            conn.execute(
+                """UPDATE jobs
+                   SET state = ?, error = ?, ended_at = ?, heartbeat_at = ?
+                   WHERE id = ? AND state IN (?, ?)""",
+                (
+                    FAILED,
+                    "runner đã chết (không còn tiến trình) — job bị bỏ rơi",
+                    now,
+                    now,
+                    jid,
+                    QUEUED,
+                    RUNNING,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO events (job_id, ts, level, kind, message)
+                   VALUES (?, ?, 'error', 'status', ?)""",
+                (jid, now, "runner chết — job được đánh dấu FAILED tự động"),
+            )
+            cleaned.append(jid)
+        return cleaned
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
 

@@ -1,27 +1,133 @@
-# Cookie/pool chứa session Google — KHÔNG BAO GIỜ commit
-pools/*
-!pools/example.json
+# =============================================================================
+# Dữ liệu nhạy cảm — KHÔNG BAO GIỜ commit
+# =============================================================================
 
-# Báo cáo deep research
-reports/
+# Pool cookie (chứa session token Google)
+# Dùng `**/` vì thư mục pool nằm trong `my-geminiweb-orchestrator/`, không phải
+# gốc repo — pattern `pools/*` (có dấu "/" ở giữa) bị Git anchor ở thư mục
+# chứa .gitignore nên KHÔNG match.
+**/pools/*
+!**/pools/example.json
 
-# Python
+# Bản sao JSON cookie gốc do user nhập tay (chứa session token)
+**/cookie_files/
+
+# Registry tài khoản (email + mật khẩu mã hoá DPAPI)
+**/accounts.json
+
+# Báo cáo deep research / output job / file Gemini sinh ra
+**/reports/
+
+# Credential của orchestrator (nếu có)
+**/credentials*.json
+*.dpapi
+
+# =============================================================================
+# Python / Orchestrator (my-geminiweb-orchestrator)
+# =============================================================================
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
 .venv/
 venv/
+env/
+ENV/
 *.egg-info/
+.eggs/
+dist-info/
+pip-wheel-metadata/
 
-# Build artifacts (PyInstaller)
+# PyInstaller
 build/
 dist/
 *.spec.bak
+*.manifest
 
-# Editor / OS
-.vscode/
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+
+# Log
+*.log
+logs/
+
+# =============================================================================
+# .NET / C# (my-geminiweb-mcp)
+# =============================================================================
+# Build output
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+artifacts/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# Test output
+[Tt]est[Rr]esult*/
+*.coverage
+*.coveragexml
+coverage*.json
+coverage*.xml
+coverage*.info
+*.trx
+*.coverage
+TestResults/
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+!packages/build/
+project.lock.json
+project.fragment.lock.json
+artifacts.lock.json
+*.nuget.dgspec.json
+*.nuget.props
+*.nuget.targets
+**/obj/
+**/bin/
+
+# Rider / VS Code / VS
+.vs/
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/extensions.json
 .idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
 Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
 
-# Logs
-*.log
+# =============================================================================
+# Lock file / dữ liệu sinh tự động
+# =============================================================================
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# Claude / Cursor local state
+.claude/settings.local.json
+.cursor/settings.local.json

@@ -55,31 +55,17 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+#: Thư mục gốc dữ liệu — dùng chung với mọi module (xem `orchestrator.paths`).
+#:
+#: TRƯỚC ĐÂY module này tự tìm `pools/` riêng (`_resolve_pools_dir()` chỉ check
+#: `cwd`), khác với `accounts._data_root()` và `tools/gemini_pool._resolve_dir()`
+#: (walk up cây thư mục). Hệ quả: chạy `dist/orchestrator-gui/orchestrator-gui.exe`
+#: thì GUI ghi cookie vào `%LOCALAPPDATA%\\Orchestrator\\pools\\` còn dashboard đọc
+#: `<repo>\\pools\\` → split-brain, bảng hiện UNAVAILABLE dù popup báo thành công.
+#: GIỜ: mọi module dùng chung `orchestrator.paths` → không còn split-brain.
+from orchestrator import paths  # noqa: E402
 
-def _resolve_pools_dir() -> Path:
-    """Tìm thư mục `pools/`.
-
-    Thứ tự:
-      1. `GEMINI_POOLS_DIR` (explicit, ưu tiên cao nhất).
-      2. Khi chạy từ source → `<repo>/pools`.
-      3. Khi chạy từ `.exe` → `<cwd>/pools` nếu cwd trông như repo, else
-         `%LOCALAPPDATA%\\Orchestrator\\pools` (để .exe dùng độc lập repo).
-    """
-    env = os.environ.get("GEMINI_POOLS_DIR")
-    if env:
-        return Path(env)
-
-    if not getattr(sys, "frozen", False):
-        return REPO_ROOT / "pools"
-
-    cwd = Path.cwd()
-    if (cwd / "pools").is_dir() or (cwd / ".git").exists():
-        return cwd / "pools"
-    local = Path(os.environ.get("LOCALAPPDATA", "")) / "Orchestrator"
-    return local / "pools"
-
-
-POOLS_DIR = _resolve_pools_dir()
+POOLS_DIR = paths.POOLS_DIR
 
 REQUIRED = "__Secure-1PSID"
 OPTIONAL = "__Secure-1PSIDTS"
@@ -525,6 +511,102 @@ class ChromeSession:
 # ---------------------------------------------------------------------------
 
 
+#: Thư mục lưu **bản sao JSON cookie** mà user đã nhập, để không mất khi
+#: pool file bị ghi đè bởi `sync()`. Đường dẫn: `<data root>/cookie_files/`.
+#:
+#: - `cookie_files/<pool>.json`      → bản mới nhất (đè lại)
+#: - `cookie_files/history/<pool>-<timestamp>.json` → lịch sử, giữ 20 bản
+COOKIE_ARCHIVE_DIRNAME = "cookie_files"
+
+#: Số bản lịch sử cookie giữ lại cho mỗi pool.
+COOKIE_HISTORY_KEEP = 20
+
+
+def cookie_archive_dir() -> Path:
+    """Thư mục lưu bản sao JSON cookie."""
+    return paths.COOKIE_ARCHIVE_DIR
+
+
+def save_cookie_archive(
+    account: str,
+    raw_text: str,
+    *,
+    pool_name: str | None = None,
+    account_email: str | None = None,
+) -> Path:
+    """Lưu bản sao JSON cookie người dùng vừa nhập vào đĩa.
+
+    Mục đích: pool file (`pools/<pool>.json`) bị `sync()` ghi đè mỗi lần với
+    cookie live. Bản gốc user paste vào (lúc nhập acc) là thứ **không thể
+    tái tạo** — nếu session chết mà pool file đã bị ghi đè thì mất trắng.
+
+    Args:
+        account: tên account.
+        raw_text: nội dung JSON cookie gốc.
+        pool_name: tên pool (mặc định: pool của account).
+
+    Returns:
+        Path của file mới nhất đã ghi.
+    """
+    name = pool_name or default_pool_for(account)
+    root = cookie_archive_dir()
+    root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        payload = json.loads(raw_text)
+    except ValueError:
+        # Không parse được → vẫn lưu nguyên bản text để không mất dữ liệu.
+        payload = {"_raw_text": raw_text}
+
+    envelope = {
+        "name": name,
+        "profile": account,
+        "account_email": account_email,
+        "source": "orchestrator-paste-cookie",
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "cookies": payload,
+    }
+    latest = root / f"{name}.json"
+    _write_json_atomic(latest, envelope)
+
+    # Lịch sử: xoay vòng, giữ tối đa COOKIE_HISTORY_KEEP bản.
+    hist = root / "history"
+    hist.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    _write_json_atomic(hist / f"{name}-{stamp}.json", envelope)
+    olds = sorted(hist.glob(f"{name}-*.json"))
+    for old in olds[:-COOKIE_HISTORY_KEEP]:
+        old.unlink(missing_ok=True)
+
+    return latest
+
+
+def list_cookie_archives() -> list[dict[str, Any]]:
+    """Liệt kê các bản cookie đã lưu (mới nhất trước)."""
+    root = cookie_archive_dir()
+    if not root.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for f in sorted(root.glob("*.json")):
+        if f.name.startswith("."):
+            continue
+        try:
+            payload = _read_json(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        out.append(
+            {
+                "file": str(f),
+                "name": payload.get("name"),
+                "profile": payload.get("profile"),
+                "saved_at": payload.get("saved_at"),
+            }
+        )
+    return out
+
+
 def _looks_signed_out(page_text: str) -> bool:
     """Trang Gemini có đang yêu cầu đăng nhập không?
 
@@ -606,14 +688,25 @@ def adopt(
         "browser": "chrome",
         "profile": account,
         "source": "orchestrator-cookie-sync",
-        "cookies": [
-            {"name": n, "value": cookies[n], "domain": ".google.com"}
-            for n in (REQUIRED, OPTIONAL)
-            if n in cookies
-        ],
+        # CHỈ 2 cookie xác thực — xem `_cookie_list()`.
+        "cookies": _cookie_list(live),
     }
     _write_json_atomic(POOLS_DIR / f"{name}.json", payload)
     set_account_pool(account, name)
+
+    # Lưu bản gốc để không mất khi `sync()` ghi đè pool file.
+    archive = save_cookie_archive(
+        account,
+        json.dumps(
+            [{"name": n, "value": cookies[n], "domain": ".google.com"} for n in cookies],
+            ensure_ascii=False,
+        ),
+        pool_name=name,
+        account_email=account_email,
+    )
+
+    # Xoá cache cookie cũ — nếu không, nó che cookie mới vừa cấy.
+    purge_gemini_cache(live.get(REQUIRED))
 
     return {
         "ok": True,
@@ -623,6 +716,168 @@ def adopt(
         "cookies_live": len(live),
         "signed_in": signed_in,
         "pool_file": str(POOLS_DIR / f"{name}.json"),
+        "cookie_archive": str(archive),
+        "page_preview": page_text.replace("\n", " ")[:200],
+    }
+
+
+def _cookie_list(cookies: dict[str, str]) -> list[dict[str, str]]:
+    """Chuyển dict cookie → list shape của pool file.
+
+    CHỈ giữ **2 cookie xác thực** (`__Secure-1PSID`, `__Secure-1PSIDTS`).
+
+    Vì sao KHÔNG lưu toàn bộ cookie (đã verify bằng script thật, 2026-11-14):
+
+    | tập cookie                      | kết quả `account_status` |
+    |---------------------------------|--------------------------|
+    | 2 cookie (`1PSID` + `1PSIDTS`) | **AVAILABLE** ✅           |
+    | 35 cookie (toàn bộ profile)     | UNAUTHENTICATED ❌        |
+    | 31 cookie (bỏ `__Host-*`)       | UNAUTHENTICATED ❌        |
+
+    Lý do: `gemini_webapi` chỉ gửi `1PSID` + `1PSIDTS` lên server
+    (`client.py:192-197`, `tools/gemini_pool.py::Pool.new_client`). Nhưng
+    `get_access_token.py` dựng `Cookies` jar từ **toàn bộ** dict ta đưa vào
+    → các cookie khác (`SID`, `HSID`, `APISID`, `__Host-*`...) đi kèm và
+    request bị Google từ chối → `UNAUTHENTICATED`.
+
+    Cookie đầy đủ vẫn được giữ trong **profile Chrome** (đó là nguồn sự thật)
+    và trong bản archive `cookie_files/`; pool file chỉ cần 2 cookie auth.
+    """
+    return [
+        {"name": n, "value": cookies[n], "domain": ".google.com"}
+        for n in (REQUIRED, OPTIONAL)
+        if cookies.get(n)
+    ]
+
+
+def _parse_cookie_json(raw_text: str) -> dict[str, str]:
+    """Parse JSON cookie **dán trực tiếp** từ clipboard.
+
+    Chấp nhận mọi shape mà người dùng có thể copy:
+      - Cookie-Editor export:  `[{"domain":..., "name":..., "value":...}, ...]`
+      - Pool file:             `{"cookies": [{"name":..., "value":...}, ...]}`
+      - Map phẳng:            `{"__Secure-1PSID": "...", ...}`
+      - Có bọc trong thuộc tính lạ: `{"data": [...]}` / `{"items": [...]}`
+
+    Raises:
+        ValueError: JSON hỏng hoặc không tìm thấy cookie nào.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("Chưa có nội dung JSON.")
+
+    try:
+        raw = json.loads(text)
+    except ValueError as e:
+        # Gợi ý cụ thể vì lỗi phổ biến nhất là copy kèm text thừa.
+        raise ValueError(f"JSON không hợp lệ: {e}") from e
+
+    # Bỏ bọc 1-2 lớp nếu có key chứa list/dict.
+    if isinstance(raw, dict):
+        for key in ("data", "items", "cookies", "result"):
+            inner = raw.get(key)
+            if isinstance(inner, (list, dict)):
+                raw = inner
+                break
+
+    cookies = extract_cookies(raw)
+    if not cookies:
+        raise ValueError(
+            "Không tìm thấy cookie nào trong JSON. Cần ít nhất "
+            f"'{REQUIRED}' (export từ tab gemini.google.com đã đăng nhập)."
+        )
+    if REQUIRED not in cookies:
+        raise ValueError(
+            f"JSON không có cookie '{REQUIRED}'. "
+            "Hãy export từ tab gemini.google.com đã đăng nhập."
+        )
+    return cookies
+
+
+def adopt_json(
+    account: str,
+    raw_text: str,
+    *,
+    pool_name: str | None = None,
+    account_email: str | None = None,
+    port: int | None = None,
+    verify_login: bool = True,
+) -> dict[str, Any]:
+    """Cấy cookie từ **JSON dán trực tiếp** (không cần file tạm).
+
+    Đây là biến thể "paste" của `adopt()` — cùng hệt logic, chỉ khác nguồn
+    input: chuỗi JSON thay vì đường dẫn file. GUI dùng hàm này khi user
+    bấm "Nhập cookie" → popup textarea → paste → lưu.
+
+    Nếu Chrome riêng của account đã tồn tại, ta **không xoá** profile (khác
+    `adopt()`): profile đó có thể đang giữ DBSC key của session cũ. Xoá
+    profile sẽ phá session đang hoạt động.
+
+    Args:
+        account: tên account (thư mục Chrome riêng).
+        raw_text: nội dung JSON cookie.
+        pool_name: tên pool để ghi (mặc định: pool của account).
+        account_email: email để ghi vào pool file.
+        port: cổng debug (mặc định: tự chọn).
+        verify_login: mở Gemini để xác nhận đã đăng nhập.
+
+    Returns:
+        dict kết quả — cùng shape với `adopt()`.
+    """
+    cookies = _parse_cookie_json(raw_text)
+
+    udd = account_dir(account)
+    udd.mkdir(parents=True, exist_ok=True)
+
+    port = port or _find_free_port(_account_port_base(account))
+    # Profile đã tồn tại → dùng lại (không xoá) để giữ DBSC key.
+    reuse = udd.is_dir() and any(udd.iterdir())
+    with ChromeSession(udd, port=port, reuse_existing=reuse) as s:
+        added = s.set_cookies(cookies)
+        live = s.cookies()
+        page_text = s.goto(GEMINI_URL) if verify_login else ""
+
+    signed_in = REQUIRED in live and not _looks_signed_out(page_text)
+
+    name = pool_name or default_pool_for(account)
+    if not account_email:
+        existing = POOLS_DIR / f"{name}.json"
+        if existing.is_file():
+            try:
+                prev = _read_json(existing)
+                if isinstance(prev, dict):
+                    account_email = prev.get("account_email")
+            except (OSError, ValueError):
+                pass
+    payload = {
+        "name": name,
+        "account_email": account_email,
+        "browser": "chrome",
+        "profile": account,
+        "source": "orchestrator-cookie-sync",
+        # CHỈ 2 cookie xác thực — xem `_cookie_list()`.
+        "cookies": _cookie_list(live),
+    }
+    _write_json_atomic(POOLS_DIR / f"{name}.json", payload)
+    set_account_pool(account, name)
+
+    # Lưu bản gốc user paste (không thể tái tạo từ pool file).
+    archive = save_cookie_archive(
+        account, raw_text, pool_name=name, account_email=account_email
+    )
+
+    # Xoá cache cookie cũ — nếu không, nó che cookie mới vừa cấy.
+    purge_gemini_cache(live.get(REQUIRED))
+
+    return {
+        "ok": True,
+        "account": account,
+        "user_data_dir": str(udd),
+        "cookies_seeded": added,
+        "cookies_live": len(live),
+        "signed_in": signed_in,
+        "pool_file": str(POOLS_DIR / f"{name}.json"),
+        "cookie_archive": str(archive),
         "page_preview": page_text.replace("\n", " ")[:200],
     }
 
@@ -683,33 +938,51 @@ def sync(
             "profile": account,
             "source": "orchestrator-cookie-sync",
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "cookies": [
-                {"name": n, "value": live[n], "domain": ".google.com"}
-                for n in (REQUIRED, OPTIONAL)
-                if n in live
-            ],
+            # CHỈ lưu 2 cookie xác thực — xem `_cookie_list()` để biết vì sao
+            # lưu toàn bộ cookie làm session bị `UNAUTHENTICATED`.
+            #
+            # Bẫy đã gặp (2026-11-14): trước đây lưu 35 cookie → mọi pool báo
+            # `UNAVAILABLE` dù session thật sự còn sống. Verify:
+            #   2 cookie  → AVAILABLE
+            #   35 cookie → UNAUTHENTICATED
+            "cookies": _cookie_list(live),
         }
     )
     _write_json_atomic(pool_file, payload)
     set_account_pool(account, name)
+
+    # Xoá cache cookie cũ của `gemini_webapi` — nó che (shadow) `1PSIDTS` mới
+    # và làm session báo `UNAUTHENTICATED` giả. Xem `purge_gemini_cache()`.
+    purged = purge_gemini_cache(live.get(REQUIRED))
 
     # Kiểm tra session thật (không chỉ cookie còn sống).
     #
     # Bẫy đã gặp: cookie vẫn còn (21 cookie) nhưng Google đã hết hạn session
     # → `gemini_webapi` trả `UNAUTHENTICATED`, mọi Deep Research fail với
     # "Permission denied". Chỉ đọc cookie là không đủ.
-    session = _probe_session(live)
+    session = _probe_session(_auth_cookies(live))
 
     return {
         "ok": True,
         "account": account,
         "cookies": len(live),
+        "cookies_saved": len(payload["cookies"]),
         "pool_file": str(pool_file),
         "updated_at": payload["updated_at"],
         "session_ok": session.get("ok"),
         "account_status": session.get("account_status"),
+        "cache_purged": len(purged),
         "warning": session.get("warning"),
     }
+
+
+def _auth_cookies(cookies: dict[str, str]) -> dict[str, str]:
+    """Chỉ giữ 2 cookie xác thực từ tập cookie live.
+
+    `gemini_webapi` chỉ dùng `1PSID` + `1PSIDTS`. Truyền thêm cookie khác
+    làm request bị Google từ chối → `UNAUTHENTICATED` (đã verify).
+    """
+    return {n: cookies[n] for n in (REQUIRED, OPTIONAL) if cookies.get(n)}
 
 
 def _probe_session(cookies: dict[str, str]) -> dict[str, Any]:
@@ -717,9 +990,15 @@ def _probe_session(cookies: dict[str, str]) -> dict[str, Any]:
 
     Trả về `{"ok": bool, "account_status": str|None, "warning": str|None}`.
     Không raise — lỗi mạng chỉ là `ok=False` + warning.
+
+    **Tự xoá cache cookie cũ** của `gemini_webapi` trước khi probe — nếu không,
+    cache sẽ che `1PSIDTS` mới và probe luôn trả `UNAUTHENTICATED` giả.
     """
     if REQUIRED not in cookies:
         return {"ok": False, "account_status": None, "warning": "thiếu cookie 1PSID"}
+
+    # Xoá cache cũ (nếu có) để probe dùng đúng cookie hiện tại.
+    purge_gemini_cache(cookies[REQUIRED])
 
     try:
         import asyncio
@@ -763,6 +1042,56 @@ def _probe_session(cookies: dict[str, str]) -> dict[str, Any]:
             "loại 2 dùng `account login` (tự động), với loại 1 dùng `cookie login`."
         )
     return {"ok": ok, "account_status": status, "warning": warning}
+
+
+# ---------------------------------------------------------------------------
+# Cache cookie của gemini_webapi (nguồn gây "session chết giả")
+# ---------------------------------------------------------------------------
+
+#: `gemini_webapi` cache cookie tại `%TEMP%\gemini_webapi\.cached_cookies_<1PSID>.json`.
+#:
+#: Cơ chế `get_access_token.py` (Phase 1):
+#:   1. Nạp jar từ cache → `Cookies(base_jar)` rồi `set()` cookie trong cache
+#:      → ghi **đè** `1PSIDTS` mới trong pool file.
+#:   2. Thử nhóm "Cache" **trước** nhóm "Base Cookies".
+#:
+#: → Nếu cache còn `1PSIDTS` cũ (đã hết hạn), nó **che (shadow)** cookie mới
+#: và mọi request dùng session cũ → `UNAUTHENTICATED`, dù pool file đúng.
+#:
+#: Verify (2026-11-14, script `reports/_shadow_test.py`):
+#:   cache có 1PSIDTS cũ  → UNAUTHENTICATED
+#:   xoá cache            → AVAILABLE
+def _gemini_cache_dir() -> Path:
+    """Thư mục cache cookie của `gemini_webapi`."""
+    env = os.environ.get("GEMINI_COOKIE_PATH")
+    if env:
+        return Path(env)
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / "gemini_webapi"
+
+
+def purge_gemini_cache(psid: str | None = None) -> list[str]:
+    """Xoá cache cookie của `gemini_webapi` (bị lỗi thời che session mới).
+
+    Args:
+        psid: chỉ xoá cache của 1 session cụ thể. `None` → xoá tất cả.
+
+    Returns:
+        Danh sách file đã xoá.
+    """
+    d = _gemini_cache_dir()
+    if not d.is_dir():
+        return []
+    pattern = f".cached_cookies_{psid}.json" if psid else ".cached_cookies_*.json"
+    removed: list[str] = []
+    for f in d.glob(pattern):
+        try:
+            f.unlink()
+            removed.append(str(f))
+        except OSError:
+            pass
+    return removed
 
 
 def login(account: str, *, port: int | None = None) -> dict[str, Any]:

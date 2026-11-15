@@ -27,6 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "tools"))
 
 from orchestrator import store  # noqa: E402
+from orchestrator.gemini_files import (  # noqa: E402
+    decode_blob,
+    extract_generated_files,
+    sanitize_filename,
+)
 
 from gemini_pool import (  # noqa: E402
     OPTIONAL,
@@ -101,6 +106,99 @@ async def _open_client(pool: Any):
     )
     await client.init(auto_refresh=True, refresh_interval=600)
     return client
+
+
+# ---------------------------------------------------------------------------
+# File đính kèm (upload) và file Gemini sinh ra (download)
+# ---------------------------------------------------------------------------
+
+#: Nơi lưu file Gemini sinh ra.
+DOWNLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "reports" / "downloads"
+
+
+def _resolve_attachments(params: dict[str, Any]) -> list[Path]:
+    """Chuẩn hoá `params["attachments"]` thành danh sách file tồn tại.
+
+    Chấp nhận: chuỗi đường dẫn, list đường dẫn, hoặc dict
+    `{"path": ..., "name": ...}`.
+    """
+    raw = params.get("attachments")
+    if not raw:
+        return []
+    items = raw if isinstance(raw, (list, tuple)) else [raw]
+    out: list[Path] = []
+    for item in items:
+        p = item.get("path") if isinstance(item, dict) else item
+        if not p:
+            continue
+        path = Path(str(p)).expanduser()
+        if not path.is_absolute():
+            path = (Path(__file__).resolve().parent.parent.parent / path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"file đính kèm không tồn tại: {path}")
+        out.append(path)
+    return out
+
+
+async def _download_generated_files(
+    client: Any, candidate_data: Any, job_id: str
+) -> list[dict[str, Any]]:
+    """Tải các file Gemini đã sinh (xlsx/pdf/csv/...) về `reports/downloads/`.
+
+    `candidate_data` là raw candidate từ `_parse_candidate`. Gemini đặt file vào
+    field 59 của rich content với `[file-tag: code-generated-file-...]`, kèm URL
+    `contribution.usercontent.google.com/download` — verify 2026-11-14.
+    """
+    if not candidate_data:
+        return []
+    infos = extract_generated_files(candidate_data)
+    if not infos:
+        return []
+
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    saved: list[dict[str, Any]] = []
+    for info in infos:
+        fname = sanitize_filename(info.get("filename"), "gemini_output.bin")
+        dest = DOWNLOAD_DIR / fname
+        # Tránh ghi đè nếu trùng tên.
+        if dest.exists():
+            stem, suf = dest.stem, dest.suffix
+            n = 1
+            while (DOWNLOAD_DIR / f"{stem}-{n}{suf}").exists():
+                n += 1
+            dest = DOWNLOAD_DIR / f"{stem}-{n}{suf}"
+
+        data: bytes | None = None
+        url = info.get("download_url")
+        if url:
+            try:
+                r = await client.client.get(
+                    url, headers={"Referer": "https://gemini.google.com/"}
+                )
+                if r.status_code == 200 and r.content:
+                    data = r.content
+                else:
+                    _emit(
+                        job_id,
+                        f"Tải file {fname} thất bại: HTTP {r.status_code}",
+                        level="warn",
+                    )
+            except Exception as e:
+                _emit(job_id, f"Tải file {fname} lỗi: {e}", level="warn")
+        if data is None:
+            data = decode_blob(info)
+        if data:
+            dest.write_bytes(data)
+            saved.append(
+                {
+                    "filename": fname,
+                    "path": str(dest),
+                    "size": len(data),
+                    "url": url,
+                }
+            )
+            _emit(job_id, f"Đã tải file: {fname} ({len(data)} bytes)", kind="result")
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +391,12 @@ def _extract_canvas(text: str) -> dict[str, Any]:
 
 
 async def run_chat(job_id: str, prompt: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Chat thường với Gemini, không chờ plan, không cần confirm."""
+    """Chat thường với Gemini, không chờ plan, không cần confirm.
+
+    **Tiếp tục cùng hội thoại**: truyền `params["chat_metadata"]` (list
+    `[cid, rid, rcid]` lấy từ job trước) → job này nối vào đúng hội thoại đó.
+    Xem `docs/COOKIE-BRIDGE.md` § chat nhiều lượt.
+    """
     pool, detail = _resolve_pool(params.get("pool"))
     _emit(job_id, f"Pool: {pool.name} ({pool.account_email})", kind="status")
     store.update_job(job_id, pool=pool.name, account=pool.account_email)
@@ -302,39 +405,113 @@ async def run_chat(job_id: str, prompt: str, params: dict[str, Any]) -> dict[str
     try:
         client = await _open_client(pool)
         model = params.get("model")
-        chat = client.start_chat(model=model) if model else client.start_chat()
+
+        # Metadata của hội thoại cũ (nếu có) → nối tiếp thay vì tạo mới.
+        metadata = params.get("chat_metadata")
+        if isinstance(metadata, (list, tuple)) and metadata:
+            chat = client.start_chat(model=model, metadata=list(metadata)) if model else (
+                client.start_chat(metadata=list(metadata))
+            )
+            _emit(job_id, "Tiếp tục hội thoại cũ.", kind="status")
+        else:
+            chat = client.start_chat(model=model) if model else client.start_chat()
+
         _emit(job_id, f"Đang gửi chat (model={model or 'default'})...", kind="status")
+
+        # File đính kèm (upload lên Gemini).
+        attachments = _resolve_attachments(params)
+        if attachments:
+            _emit(
+                job_id,
+                "Đính kèm: " + ", ".join(p.name for p in attachments),
+                kind="status",
+            )
+
+        # Bắt raw candidate để dò file Gemini sinh ra (xlsx/pdf/...).
+        captured: list[Any] = []
+        orig_parse = client._parse_candidate
+
+        def _capture(candidate_data: Any, cid: Any, rid: Any, rcid: Any):
+            captured.append(candidate_data)
+            return orig_parse(candidate_data, cid, rid, rcid)
+
+        client._parse_candidate = _capture  # type: ignore[method-assign]
 
         text_parts: list[str] = []
         thoughts = ""
         last_text = ""
-        async for output in client.generate_content_stream(
-            prompt,
-            chat=chat,
-            extended_thinking=bool(params.get("extended_thinking")),
-        ):
-            # `output.text` là CUMULATIVE trong stream mode; `text_delta` mới là
-            # phần mới. Nối `text` sẽ ra "PONG"+"PONG"+"PONG".
-            delta = getattr(output, "text_delta", None)
-            if delta:
-                text_parts.append(delta)
-            elif output.text:
-                last_text = output.text
-            if getattr(output, "thoughts", None):
-                thoughts = output.thoughts
-            store.heartbeat(job_id)
+        # Retry khi Google trả lỗi tạm thời (1097 / 1013).
+        #
+        # Bẫy đã gặp (2026-11-14): job chat nối tiếp submit ngay sau job
+        # trước → `1PSIDTS` của session cũ vừa bị rotate, request lượt 2
+        # dùng token cũ → server trả `APIError 1097`. Chỉ cần thử lại vài
+        # giây sau là xong.
+        #
+        # Verify: cùng cặp job, chạy lại với retry → PASS (`cid` khớp, nhớ
+        # ngữ cảnh).
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                text_parts = []
+                last_text = ""
+                async for output in client.generate_content_stream(
+                    prompt,
+                    chat=chat,
+                    files=attachments or None,
+                    extended_thinking=bool(params.get("extended_thinking")),
+                ):
+                    # `output.text` là CUMULATIVE trong stream mode; `text_delta` mới là
+                    # phần mới. Nối `text` sẽ ra "PONG"+"PONG"+"PONG".
+                    delta = getattr(output, "text_delta", None)
+                    if delta:
+                        text_parts.append(delta)
+                    elif output.text:
+                        last_text = output.text
+                    if getattr(output, "thoughts", None):
+                        thoughts = output.thoughts
+                    store.heartbeat(job_id)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                msg = str(e)
+                transient = "1097" in msg or "1013" in msg or "temporar" in msg.lower()
+                if not transient or attempt >= 3:
+                    raise
+                wait = 5 * attempt
+                _emit(
+                    job_id,
+                    f"Lỗi tạm thời (lần {attempt}/3), thử lại sau {wait}s: {msg[:120]}",
+                    level="warn",
+                )
+                await asyncio.sleep(wait)
+        if last_error is not None:
+            raise last_error
 
         text = "".join(text_parts) or last_text
         citations = _citations_of(output) if output else []
         _emit(job_id, f"Nhận {len(text)} ký tự, {len(citations)} citations", kind="result")
 
+        # File Gemini sinh ra (xlsx / pdf / csv / ...) → tải về reports/downloads.
+        files: list[dict[str, Any]] = []
+        if captured:
+            files = await _download_generated_files(client, captured[-1], job_id)
+
+        # Metadata của hội thoại (cid/rid/rcid) → job sau có thể nối tiếp.
+        lo = getattr(chat, "last_output", None)
+        chat_metadata = list(getattr(lo, "metadata", []) or []) if lo else []
+
         result: dict[str, Any] = {
             "text": text,
             "citations": citations,
             "cid": getattr(chat, "cid", None),
+            "chat_metadata": chat_metadata,
             "pool": pool.name,
             "model_used": model,
+            "files": files,
         }
+        if attachments:
+            result["attachments"] = [str(p) for p in attachments]
         if thoughts:
             result["thoughts"] = thoughts
 

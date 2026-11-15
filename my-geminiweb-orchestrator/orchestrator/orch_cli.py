@@ -103,6 +103,23 @@ def cmd_submit(args: argparse.Namespace) -> int:
         params["profile_directory"] = args.profile_directory
     if args.headless is not None:
         params["headless"] = args.headless
+    if args.chat_metadata:
+        # Tiếp tục cùng hội thoại chat (metadata từ job trước).
+        try:
+            params["chat_metadata"] = _load_chat_metadata(args.chat_metadata)
+        except ValueError as e:
+            print(f"LỖI: {e}", file=sys.stderr)
+            return 1
+    if args.attach:
+        # File đính kèm gửi lên Gemini.
+        attaches = []
+        for a in args.attach:
+            p = Path(a).expanduser()
+            if not p.is_file():
+                print(f"LỖI: file đính kèm không tồn tại: {p}", file=sys.stderr)
+                return 1
+            attaches.append(str(p.resolve()))
+        params["attachments"] = attaches
 
     res = dispatch.submit(
         args.kind,
@@ -114,6 +131,35 @@ def cmd_submit(args: argparse.Namespace) -> int:
     )
     _print(res)
     return 0 if res.get("state") != store.FAILED else 1
+
+
+def _load_chat_metadata(raw: str) -> list[str]:
+    """Parse `chat_metadata` — JSON array, hoặc `@file.json`, hoặc `job_id`.
+
+    Nguồn: `result.chat_metadata` của job chat trước, hoặc `result.cid`.
+    """
+    text = raw.strip()
+    if text.startswith("@"):
+        text = Path(text[1:]).read_text(encoding="utf-8")
+    elif not text.startswith("["):
+        # Có thể là job_id → lấy chat_metadata từ job đó.
+        job = store.get_job(text)
+        if job is None:
+            raise ValueError(f"không tìm thấy job {text!r}")
+        result = job.get("result") or {}
+        meta = result.get("chat_metadata")
+        if not meta:
+            raise ValueError(
+                f"job {text!r} không có chat_metadata (có phải job chat không?)"
+            )
+        return list(meta)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"chat_metadata không phải JSON hợp lệ ({e})") from e
+    if not isinstance(data, list):
+        raise ValueError("chat_metadata phải là JSON array")
+    return [str(x) for x in data]
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -197,6 +243,21 @@ def cmd_purge(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_board(args: argparse.Namespace) -> int:
+    """Snapshot toàn hệ thống (dashboard)."""
+    from orchestrator import board
+
+    _print(board.snapshot(refresh_quota=args.refresh_quota))
+    return 0
+
+
+def cmd_reap(args: argparse.Namespace) -> int:
+    """Dọn job mồ côi (runner đã chết)."""
+    cleaned = store.reap_orphans(grace=args.grace)
+    _print({"cleaned": cleaned, "count": len(cleaned)})
+    return 0
+
+
 def cmd_chrome(args: argparse.Namespace) -> int:
     from orchestrator import chrome_profile
 
@@ -212,6 +273,73 @@ def cmd_chrome(args: argparse.Namespace) -> int:
         return 1
     _print(res)
     return 0
+
+
+def cmd_harvest(args: argparse.Namespace) -> int:
+    """Thu hoạch cookie tự động cho mọi account + tự chữa session chết."""
+    from orchestrator import harvest
+
+    if args.harvest_cmd == "list":
+        _print({"ok": True, "profiles": harvest.list_profiles()})
+        return 0
+
+    if args.harvest_cmd == "account":
+        out = harvest.harvest_account(
+            args.account, pool_name=args.pool, heal=not args.no_heal
+        )
+        _print(out)
+        return 0 if out.get("session_ok") else 1
+
+    out = harvest.harvest_all(heal=not args.no_heal)
+    if args.report:
+        out["report_path"] = str(harvest.write_harvest_report(out))
+    _print(out)
+    return 0 if out.get("alive") == out.get("total") else 1
+
+
+def cmd_bridge(args: argparse.Namespace) -> int:
+    """Cookie bridge — nhận cookie từ extension trong browser thật.
+
+    Đây là cách **tự động lấy cookie** cho account đã đăng nhập trong
+    Chrome/Edge của user (App-Bound Encryption chặn đọc từ ngoài tiến trình,
+    nhưng extension chạy BÊN TRONG browser thì đọc được).
+    """
+    from orchestrator import cookie_bridge
+
+    if args.bridge_cmd == "info":
+        _print(
+            {
+                "url": f"http://127.0.0.1:{args.port}",
+                "endpoint": f"http://127.0.0.1:{args.port}/harvest",
+                "token": cookie_bridge.current_token(rotate=args.rotate),
+                "extension_dir": str(
+                    cookie_bridge.paths.DATA_ROOT
+                    / "browser_extension"
+                    / "orchestrator-bridge"
+                ),            }
+        )
+        return 0
+
+    if args.bridge_cmd == "start":
+        srv = cookie_bridge.BridgeServer(args.port, rotate_token=not args.keep_token)
+        srv.start()
+        import threading
+
+        threading.Thread(target=srv._watchdog, daemon=True).start()
+        info = srv.info()
+        _print(info)
+        print(
+            "\n[bridge] đang chạy. Bấm icon extension trong Chrome/Edge → "
+            "dán token → 'Gửi cookie'. (Ctrl+C để dừng)",
+            file=sys.stderr,
+        )
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            srv.stop()
+        return 0
+    return 2
 
 
 def cmd_cookie(args: argparse.Namespace) -> int:
@@ -240,15 +368,33 @@ def cmd_cookie(args: argparse.Namespace) -> int:
             )
         elif args.cookie_cmd == "login":
             out = cookie_sync.login(args.account)
+        elif args.cookie_cmd == "archive":
+            # Liệt kê các bản JSON cookie gốc đã lưu.
+            out = {
+                "ok": True,
+                "dir": str(cookie_sync.cookie_archive_dir()),
+                "items": cookie_sync.list_cookie_archives(),
+            }
         else:
             out = cookie_sync.status(args.account, pool_name=args.pool)
     except Exception as e:
         _print({"error": f"{type(e).__name__}: {e}"})
         return 1
     _print(out)
-    if args.cookie_cmd == "status":
+    if args.cookie_cmd in ("status", "archive"):
         return 0
     return 0 if out.get("ok", True) else 1
+
+
+def _account_status(account: str) -> dict[str, Any]:
+    """Trạng thái đầy đủ của 1 account: registry + pool + profile Chrome."""
+    from orchestrator import accounts as account_registry
+    from orchestrator import cookie_sync
+
+    info = account_registry.get(account) or {}
+    pool = info.get("pool") or cookie_sync.default_pool_for(account)
+    cs = cookie_sync.status(account, pool_name=pool)
+    return {"ok": True, "account": account, "registry": info, "cookie": cs}
 
 
 def cmd_account(args: argparse.Namespace) -> int:
@@ -284,6 +430,19 @@ def cmd_account(args: argparse.Namespace) -> int:
             from orchestrator import auto_login
 
             out = auto_login.auto_login(args.account)
+        elif cmd == "paste-cookie":
+            # Nhận JSON cookie từ stdin (pipe) hoặc từ --json-file.
+            raw = args.json
+            if raw is None:
+                raw = sys.stdin.read()
+            out = account_registry.adopt_cookie_json(
+                args.account,
+                raw,
+                email=args.email,
+                pool=args.pool,
+            )
+        elif cmd == "status":
+            out = _account_status(args.account)
         elif cmd == "list":
             out = account_registry.list_accounts()
         elif cmd == "show":
@@ -356,6 +515,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--headless", action=argparse.BooleanOptionalAction, default=None,
         help="Chạy browser ẩn (canvas)",
     )
+    p.add_argument(
+        "--chat-metadata",
+        default=None,
+        help=(
+            "Tiếp tục cùng hội thoại chat: JSON array [cid,rid,rcid], "
+            "@file.json, hoặc job_id của job chat trước"
+        ),
+    )
+    p.add_argument(
+        "--attach",
+        action="append",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Đính kèm file lên Gemini (dùng nhiều lần cho nhiều file). "
+            "File Gemini sinh ra (.xlsx/.pdf/...) được tải về reports/downloads/"
+        ),
+    )
     p.set_defaults(func=cmd_submit)
 
     p = sub.add_parser("status", help="Trạng thái + event log")
@@ -394,6 +571,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep", type=int, default=200)
     p.set_defaults(func=cmd_purge)
 
+    p = sub.add_parser("board", help="Snapshot toàn hệ thống (jobs + accounts + quota)")
+    p.add_argument(
+        "--refresh-quota",
+        action="store_true",
+        help="ép đọc quota mới (gọi mạng, chậm)",
+    )
+    p.set_defaults(func=cmd_board)
+
+    p = sub.add_parser("reap", help="Dọn job mồ côi (runner đã chết)")
+    p.add_argument("--grace", type=float, default=60.0)
+    p.set_defaults(func=cmd_reap)
+
     p = sub.add_parser("chrome", help="Quản lý hồ sơ Chrome")
     p.add_argument("chrome_cmd", choices=["list", "create"])
     p.add_argument("--name", default=None)
@@ -404,26 +593,71 @@ def build_parser() -> argparse.ArgumentParser:
         "cookie",
         help="Đồng bộ cookie Gemini tự động (không cần Cookie-Editor)",
     )
-    p.add_argument("cookie_cmd", choices=["sync", "adopt", "status", "login"])
+    p.add_argument("cookie_cmd", choices=["sync", "adopt", "status", "login", "archive"])
     p.add_argument("--account", default="mmeo", help="tên account (thư mục Chrome riêng)")
     p.add_argument("--pool", default=None, help="tên pool trong pools/")
     p.add_argument("--email", default=None, help="email tài khoản")
     p.add_argument("--export", default=None, help="file JSON export Cookie-Editor (cho adopt)")
     p.set_defaults(func=cmd_cookie)
 
+    p = sub.add_parser(
+        "harvest",
+        help="Thu hoạch cookie tự động cho mọi account + tự chữa session chết",
+    )
+    p.add_argument(
+        "harvest_cmd", choices=["all", "account", "list"], default="all", nargs="?"
+    )
+    p.add_argument("--account", default=None, help="tên account (cho 'account')")
+    p.add_argument("--pool", default=None, help="tên pool trong pools/")
+    p.add_argument(
+        "--no-heal",
+        action="store_true",
+        help="không tự đăng nhập lại khi session chết",
+    )
+    p.add_argument(
+        "--report", action="store_true", help="ghi báo cáo ra reports/harvest-*.json"
+    )
+    p.set_defaults(func=cmd_harvest)
+
+    p = sub.add_parser(
+        "bridge",
+        help="Cookie bridge — nhận cookie từ extension trong browser thật",
+    )
+    p.add_argument(
+        "bridge_cmd", choices=["start", "info"], default="info", nargs="?"
+    )
+    p.add_argument("--port", type=int, default=9477)
+    p.add_argument("--rotate", action="store_true", help="sinh token mới")
+    p.add_argument("--keep-token", action="store_true", help="giữ token cũ")
+    p.set_defaults(func=cmd_bridge)
+
     # Lệnh nội bộ: dùng để spawn runner khi chạy từ `.exe` đã đóng gói.
     # Khi frozen, `sys.executable` chính là file .exe — không thể dùng
     p = sub.add_parser(
         "account",
-        help="Quản lý tài khoản Gemini (add / login / list / remove)",
+        help="Quản lý tài khoản Gemini (add / login / paste-cookie / list / remove)",
     )
     p.add_argument(
         "account_cmd",
-        choices=["add", "set-password", "login", "list", "show", "remove"],
+        choices=[
+            "add",
+            "set-password",
+            "login",
+            "paste-cookie",
+            "status",
+            "list",
+            "show",
+            "remove",
+        ],
     )
     p.add_argument("--email", default=None, help="email tài khoản Google")
     p.add_argument("--account", default=None, help="tên account (mặc định: suy từ email)")
     p.add_argument("--pool", default=None, help="tên pool trong pools/")
+    p.add_argument(
+        "--json",
+        default=None,
+        help="JSON cookie inline (cho paste-cookie; mặc định đọc từ stdin)",
+    )
     p.add_argument(
         "--password",
         default=None,

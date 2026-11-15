@@ -63,6 +63,20 @@ HIDDEN = [
     "orchestrator.accounts",
     "orchestrator.credentials",
     "orchestrator.auto_login",
+    # Nguồn sự thật duy nhất cho đường dẫn dữ liệu + module thu hoạch cookie
+    # tự động (mở Chrome riêng → đọc cookie live → ghi pool → tự chữa).
+    "orchestrator.paths",
+    "orchestrator.harvest",
+    # Cookie bridge — nhận cookie từ extension chạy trong browser thật
+    # (App-Bound Encryption chặn đọc từ ngoài tiến trình).
+    "orchestrator.cookie_bridge",
+    # Dashboard (layout do Gemini thiết kế) + UI toolkit + popup dán cookie.
+    # `gui.py` import `dashboard` bên trong hàm → lazy import → khai báo tường minh.
+    "orchestrator.dashboard",
+    "orchestrator.ui",
+    "orchestrator.cookie_popup",
+    # Read-model tổng hợp cho dashboard (gọi `gemini_pool` trong `tools/`).
+    "orchestrator.board",
 ]
 
 # Thư mục chứa `orchestrator/` và `tools/` — cần cho PyInstaller resolve
