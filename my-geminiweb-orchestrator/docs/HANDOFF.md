@@ -1667,3 +1667,74 @@ Conversation handle **phải mang theo account sở hữu nó**. `cid` chỉ có
 - [ ] Publish lên nuget.org
 - [ ] Extension trình duyệt đồng bộ cookie cho người dùng cuối
 
+---
+
+## Session 2026-11-15 (buổi 7) — Cookie bridge + session keep-alive (C#)
+
+Commit: `896ca5b`. Trạng thái: **3 E2E PASS**, binary AOT 16.0 MB, đã push.
+
+### Phát hiện quan trọng — đã verify bằng thực nghiệm
+
+**1. Session chết trả HTTP 200 — fail im lặng.**
+
+| Gửi tới `GET /app` | HTTP | Token `SNlM0e` |
+|---|---|---|
+| Chỉ `__Secure-1PSID` | **200** | ❌ không có |
+| `1PSID` + `1PSIDTS` sai | **200** | ❌ không có |
+| `1PSID` + `1PSIDTS` đúng | 200 | ✅ có |
+
+→ Server **phải** kiểm tra sự hiện diện của token, không được dựa vào status code.
+Đây là lý do `gemini_check` phải báo `needsReharvest` thay vì coi là "ok".
+
+**2. `RotateCookies` KHÔNG cấp `__Secure-1PSIDTS` mới.**
+
+| Gọi `RotateCookies` | Kết quả |
+|---|---|
+| Chỉ 2 cookie auth | 200, `Set-Cookie: __Secure-1PSIDCC` |
+| Full jar | 200, `Set-Cookie: __Secure-1PSIDCC` |
+| `1PSIDTS` sai / rỗng | 200, `Set-Cookie: __Secure-1PSIDCC` |
+| Thiếu body | 400 |
+
+Nó chỉ đẩy lùi hạn phiên server-side + cấp lại `1PSIDCC`/`3PSIDCC`.
+`1PSIDTS` mới **không** đến từ bất kỳ request server-side nào — kể cả `GET /app`
+với full jar. Nguồn duy nhất là **browser thật đã đăng nhập**.
+
+→ **Kết luận sản phẩm:** extension trình duyệt không phải là "cho tiện" mà là
+**cơ chế duy nhất** cấp lại phiên. Đây là lý do kiến trúc đúng.
+
+*(Ghi chú: probe đầu tiên báo 401 là do script bug — không gửi cookie header.
+Đã sửa và chạy lại, kết luận ở trên.)*
+
+**3. Bộ cookie tối thiểu:** `1PSID` + `1PSIDTS` là đủ cho `GET /app`. Thiếu
+`1PSIDTS` → fail. Vẫn giữ full jar trong pool vì cần cho `RotateCookies` và
+Device Bound Session Credentials.
+
+### Đã làm
+
+| Hạng mục | Kết quả |
+|---|---|
+| `Bridge/CookieBridge.cs` | HTTP loopback `127.0.0.1:9478/harvest`, token bắt buộc, ghi atomic vào pool ✅ |
+| `Gemini/SessionKeepAlive.cs` | Vòng lặp nền ~20 phút (jitter ±15 phút), persist cookie mới ✅ |
+| `Accounts/AccountPool.cs` | `Upsert`, `FindByPsid`, cooldown 60 phút cho auth fail ✅ |
+| `Tools/GeminiTools.cs` | +`gemini_refresh`, +`gemini_bridge`; phân biệt auth fail với lỗi API ✅ |
+| Extension | `browser_extension/geminiweb-mcp-bridge/` — đọc cookie qua `chrome.cookies`, chỉ POST loopback ✅ |
+| NuGet pack | Extension được đóng gói kèm trong `.nupkg` ✅ |
+| E2E | `tests/e2e_bridge.py`, `e2e_multi_account.py`, `e2e_dead_session.py` — **cả 3 PASS** ✅ |
+
+### Bằng chứng
+
+| Script | Nội dung |
+|---|---|
+| `my-geminiweb-mcp/tests/e2e_bridge.py` | Token sai → 403; harvest → pool; 5 tool; chat thật |
+| `my-geminiweb-mcp/tests/e2e_multi_account.py` | Full 8-cookie jar; 2 account; refresh; chat ghim account |
+| `my-geminiweb-mcp/tests/e2e_dead_session.py` | Phiên chết → `needsReharvest` → loại khỏi routing → failover |
+
+### Còn lại
+
+- [ ] Upload file đính kèm sang C# (`content-push.googleapis.com/upload`)
+- [ ] Download file Gemini sinh ra (raw candidate field 59)
+- [ ] Retry + backoff cho lỗi 1013
+- [ ] Publish lên nuget.org (cần nuget.org API key)
+- [ ] Bridge tự tắt khi idle
+- [ ] Model selection (Flash / Pro / Extended Thinking)
+
