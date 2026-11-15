@@ -1597,3 +1597,73 @@ Chi tiết: `docs/COOKIE-BRIDGE.md` § 7c.
   chat thường (quota Flash còn 2363/2400 credits lúc cuối).
 - Đường upload đã có sẵn trong `gemini_webapi`; phần **download** là phần ta viết
   thêm vì thư viện chưa hỗ trợ.
+## Session 2026-11-15 (buổi 6) — Chuyển hướng sang MCP Server App (.NET, C#)
+
+### Quyết định của user
+
+| Câu hỏi | Trả lời |
+|---|---|
+| Mục tiêu cuối | Publish **NuGet** cho người khác dùng: ổn định, nhanh, thực dụng |
+| Bỏ GUI/Tkinter? | **Có** |
+| Cần 4 acc + auto-heal? | **Có** |
+| Deep Research? | **Để sau** — phiên bản đầu tối ưu chat thường |
+
+Hệ quả: sản phẩm **không được phụ thuộc Python runtime** → phải port client
+Gemini Web sang C# thuần.
+
+### Repo được chia làm 2 project (commit `35be02d`)
+
+```
+my-gemini-pro/
+├── my-geminiweb-mcp/         ← ACTIVE: MCP Server App (.NET 10, C#)
+└── my-geminiweb-orchestrator/ ← ARCHIVE: orchestrator Python (giữ làm tham khảo)
+```
+
+### Đã làm trong phiên này (commit `6f6e08f`)
+
+Port **thành công** client Gemini Web sang C# thuần, đã verify end-to-end với
+4 tài khoản thật. Chi tiết: `my-geminiweb-mcp/docs/ARCHITECTURE.md`.
+
+| Hạng mục | Kết quả |
+|---|---|
+| TLS impersonation | **KHÔNG bắt buộc** — .NET `HttpClient` TLS thuần lấy được token ✅ |
+| Chat end-to-end | `StreamGenerate` với payload JSPB 81 slot, parse frame ✅ |
+| Native AOT | Publish thành công, **15.7 MB** single-file exe ✅ |
+| NuGet pack | `MyGeminiWebMcp.0.1.0-beta.nupkg` ✅ |
+| MCP tools | `gemini_chat`, `gemini_accounts`, `gemini_check` ✅ |
+| Pool | round-robin + failover + cooldown 10 phút + pin theo account ✅ |
+| E2E 4 account thật | 3 lượt cùng conversation giữ `cid`, nhớ ngữ cảnh ✅ |
+
+### 3 bẫy protocol đã tốn thời gian — đã ghi vào code comment
+
+1. **Frame parser off-by-one.** Marker `NNN\n` đếm **UTF-16 code units** và payload
+   **bắt đầu TẠI ký tự `\n`** (newline được tính vào độ dài). Bỏ newline → mọi frame
+   lệch 1 ký tự → `frames=0`, **không có lỗi nào được báo**.
+2. **Metadata conversation là 10 slot**, không phải 3. `cid`/`rid`/`rcid` ở slot 0/1/2.
+3. **AOT phá `JsonSerializer` reflection** (IL3050). Toàn bộ JSON phải dùng `JsonNode`.
+
+### 1 bug sản phẩm đã sửa
+
+Conversation handle **phải mang theo account sở hữu nó**. `cid` chỉ có ý nghĩa trên
+đúng account đã tạo ra nó. Trước đó pool xoay account giữa 2 lượt → lượt 2 rỗng.
+Đã sửa: handle = `{"account","cid","rid"}`, lượt sau ghim đúng account.
+
+### Bằng chứng
+
+| Script | Nội dung |
+|---|---|
+| `reports/_tls_probe.py` | TLS impersonation có bắt buộc không |
+| `reports/_ground_truth.py` | Capture chính xác request Python gửi đi (để port) |
+| `reports/_frame_probe.py` | Đối chiếu quy tắc frame parser |
+| `reports/_mcp_e2e_test.py` | E2E: accounts → check → chat 2 lượt |
+| `reports/_mcp_e2e_test2.py` | E2E: 3 lượt, rotation, pin, failover, error handling |
+
+### Còn lại
+
+- [ ] Upload file đính kèm sang C# (`content-push.googleapis.com/upload`)
+- [ ] Download file Gemini sinh ra (raw candidate field 59)
+- [ ] `1PSIDTS` rotation tự động (`accounts.google.com/RotateCookies`)
+- [ ] Retry + backoff cho lỗi 1013
+- [ ] Publish lên nuget.org
+- [ ] Extension trình duyệt đồng bộ cookie cho người dùng cuối
+
