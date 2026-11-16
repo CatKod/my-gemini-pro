@@ -352,13 +352,9 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
             };
         }
 
-        var cookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["__Secure-1PSID"] = psid,
-        };
-        if (!string.IsNullOrEmpty(psidts))
-            cookies["__Secure-1PSIDTS"] = psidts;
-
+        // The cookies that are not session ids: they are shared by every account in the
+        // browser profile, so they ride along with whichever session is picked.
+        var shared = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (payload["cookies"] is JsonObject extras)
         {
             foreach (var (key, value) in extras)
@@ -366,61 +362,345 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
                 if (value is null)
                     continue;
                 string v = value.GetValue<string>();
-                if (!string.IsNullOrEmpty(v))
-                    cookies[key] = v;
+                if (!string.IsNullOrEmpty(v) && !IsSessionId(key))
+                    shared[key] = v;
             }
         }
 
-        // How the account is identified, in order of authority:
-        //
-        //   1. The name the extension sent. The user can pin it explicitly.
-        //   2. The Google account email. This is the durable identity: Google issues a
-        //      new __Secure-1PSID whenever a session rotates, so a harvest that arrives
-        //      with a fresh session id cannot be matched by session id at all.
-        //   3. The session id itself, as a last resort before creating a new entry.
-        //
-        // The email must be resolved before the session-id lookup, otherwise a stale
-        // entry that happens to hold the same session id would swallow the harvest and
-        // the real account would never be healed.
+        // Several Google accounts in one Chrome profile means several session ids in
+        // the cookie store, distinguished by their path. Only one of them belongs to the
+        // account that is currently active. The extension therefore sends every variant
+        // it found, and the server picks the one that actually resolves to an account.
+        var candidates = BuildCandidates(payload, psid, psidts, shared);
         string? resolvedEmail = email;
-        if (string.IsNullOrWhiteSpace(resolvedEmail))
+
+        // Every candidate that resolves to a real Google account is a real account in
+        // this browser profile. Storing all of them is the whole point of the bridge:
+        // one harvest from Chrome heals the whole pool at once, instead of the user
+        // having to switch accounts one by one.
+        var found = new List<(string Email, Dictionary<string, string> Cookies)>();
+
+        // The extension pairs each email with the cookies of the very tab it read the
+        // email from. That pairing is authoritative: it tells us which session belongs
+        // to which account without having to guess.
+        if (payload["sessions"] is JsonArray sessions)
         {
-            resolvedEmail = await _emailResolver.ResolveAsync(cookies);
-            if (!string.IsNullOrWhiteSpace(resolvedEmail))
+            foreach (var session in sessions.OfType<JsonObject>())
+            {
+                string? sessionEmail = (string?)session["email"];
+                string sessionUrl = (string?)session["url"] ?? "";
+
+                var sessionCookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (session["cookies"] is JsonObject sessionJar)
+                {
+                    foreach (var (key, value) in sessionJar)
+                    {
+                        if (value is null)
+                            continue;
+                        string v = value.GetValue<string>();
+                        if (!string.IsNullOrEmpty(v))
+                            sessionCookies[key] = v;
+                    }
+                }
+
+                if (!sessionCookies.ContainsKey("__Secure-1PSID"))
+                    continue;
+
+                // The content script could not read the account switcher. The server can
+                // still answer, as long as it asks the slot URL the tab was on.
+                if (string.IsNullOrWhiteSpace(sessionEmail))
+                    sessionEmail = await _emailResolver.ResolveAsync(sessionCookies, sessionUrl);
+
+                if (string.IsNullOrWhiteSpace(sessionEmail))
+                    continue;
+
+                string sessionPsidts = sessionCookies.GetValueOrDefault("__Secure-1PSIDTS", "");
                 logger?.LogInformation(
-                    "Cookie bridge: resolved account email {Email} from the harvested session.", resolvedEmail);
+                    "Cookie bridge: session email={Email} psidts={Psidts} url={Url} cookies={Count} paths={Paths}",
+                    sessionEmail,
+                    Head(sessionPsidts, 28),
+                    sessionUrl,
+                    sessionCookies.Count,
+                    string.Join(", ", (session["paths"] as JsonArray)?.OfType<JsonValue>().Select(v => v.GetValue<string>()) ?? Enumerable.Empty<string>()));
+
+                found.Add((sessionEmail, sessionCookies));
+            }
         }
 
-        if (string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(resolvedEmail))
-            name = _pool.FindByEmail(resolvedEmail);
-
-        if (string.IsNullOrWhiteSpace(name))
-            name = _pool.FindByPsid(psid);
-
-        if (string.IsNullOrWhiteSpace(name))
+        foreach (var (candidate, candidateUrl) in candidates)
         {
-            // Not a known account: create one named after the email, or after a short
-            // fingerprint of the session id so the entry is at least recognisable.
-            string label = !string.IsNullOrWhiteSpace(resolvedEmail)
-                ? resolvedEmail!.Split('@')[0]
-                : "acc-" + ShortHash(psid);
-            name = label;
+            // The extension reports the account that is active right now. Its session
+            // is the one the browser is using, so it needs no probing.
+            string? candidateEmail;
+            if (!string.IsNullOrWhiteSpace(resolvedEmail)
+                && candidate["__Secure-1PSID"] == psid
+                && found.Count == 0)
+            {
+                candidateEmail = resolvedEmail;
+            }
+            else
+            {
+                // The URL of the tab the cookies came from decides which account slot
+                // Google answers for. Without it, every session resolves to the primary
+                // account and the secondary accounts get the wrong session.
+                candidateEmail = await _emailResolver.ResolveAsync(candidate, candidateUrl);
+                logger?.LogInformation(
+                    "Cookie bridge: candidate session {Psid} -> {Email}",
+                    Head(candidate["__Secure-1PSID"] ?? "", 16),
+                    string.IsNullOrWhiteSpace(candidateEmail) ? "(unresolved)" : candidateEmail);
+            }
+
+            if (string.IsNullOrWhiteSpace(candidateEmail))
+                continue;
+
+            // The same account can show up twice (the "1" and the "3" family of
+            // the same session). Keep the first one.
+            if (found.Any(f => string.Equals(f.Email, candidateEmail, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            found.Add((candidateEmail, candidate));
         }
 
-        var account = _pool.Upsert(name!, resolvedEmail, cookies);
+        var stored = new List<string>();
 
-        logger?.LogInformation(
-            "Cookie bridge: stored account {Account} ({CookieCount} cookies).",
-            account.Name, cookies.Count);
+        foreach (var (accountEmail, set) in found)
+        {
+            // How the account is identified, in order of authority:
+            //
+            //   1. The name the extension sent. The user can pin it explicitly.
+            //   2. The Google account email. This is the durable identity: Google issues a
+            //      new __Secure-1PSID whenever a session rotates, so a harvest that arrives
+            //      with a fresh session id cannot be matched by session id at all.
+            //   3. The session id itself, as a last resort before creating a new entry.
+            //
+            // The email must be resolved before the session-id lookup, otherwise a stale
+            // entry that happens to hold the same session id would swallow the harvest and
+            // the real account would never be healed.
+            string? accountName = name;
+            if (string.IsNullOrWhiteSpace(accountName))
+                accountName = _pool.FindByEmail(accountEmail);
+
+            if (string.IsNullOrWhiteSpace(accountName))
+                accountName = _pool.FindByPsid(set["__Secure-1PSID"]);
+
+            if (string.IsNullOrWhiteSpace(accountName))
+            {
+                // Not a known account: create one named after the email, or after a short
+                // fingerprint of the session id so the entry is at least recognisable.
+                accountName = accountEmail.Split('@')[0];
+            }
+
+            var account = _pool.Upsert(accountName!, accountEmail, set);
+            stored.Add(account.Name);
+
+            logger?.LogInformation(
+                "Cookie bridge: stored account {Account} ({CookieCount} cookies).",
+                account.Name, set.Count);
+        }
+
+        if (payload["debug"] is JsonArray debug)
+        {
+            logger?.LogInformation(
+                "Cookie bridge: browser cookies -> {Debug}",
+                string.Join(", ", debug.OfType<JsonObject>().Select(d =>
+                    $"{d["name"]?.GetValue<string>()}@{d["path"]?.GetValue<string>()}[{d["storeId"]?.GetValue<string>()}]={d["prefix"]?.GetValue<string>()}")));
+        }
+
+        if (payload["stores"] is JsonArray rawStores)
+        {
+            logger?.LogInformation(
+                "Cookie bridge: {Count} store(s) -> {Stores}",
+                rawStores.Count,
+                string.Join(" | ", rawStores.OfType<JsonObject>().Select(s =>
+                    $"{s["storeId"]?.GetValue<string>()}:n={s["cookieCount"]}:tabs={string.Join(",", (s["tabIds"] as JsonArray)?.Select(t => t?.GetValue<int>()) ?? Enumerable.Empty<int?>())}:{Tail((string?)s["psidts"] ?? "", 12)}")));
+        }
+
+        string primary = stored.Count > 0 ? stored[0] : (name ?? "");
+        string? primaryEmail = found.Count > 0 ? found[0].Email : resolvedEmail;
 
         return new JsonObject
         {
             ["ok"] = true,
-            ["account"] = account.Name,
-            ["email"] = account.Email,
-            ["cookieCount"] = cookies.Count,
+            ["account"] = primary,
+            ["email"] = primaryEmail,
+            ["accounts"] = new JsonArray(stored.Select(s => (JsonNode)s).ToArray()),
+            ["cookieCount"] = found.Count > 0 ? found[0].Cookies.Count : 0,
             ["hasPsidts"] = !string.IsNullOrEmpty(psidts),
         };
+    }
+
+    /// <summary>Whether a cookie name belongs to the Google session-id family.</summary>
+    private static bool IsSessionId(string name) =>
+        name.StartsWith("__Secure-1PSID", StringComparison.Ordinal)
+        || name.StartsWith("__Secure-3PSID", StringComparison.Ordinal);
+
+    /// <summary>Builds a complete cookie set from a session id and the shared cookies.</summary>
+    private static Dictionary<string, string> BuildCookieSet(
+        string psid,
+        string psidts,
+        IReadOnlyDictionary<string, string> shared)
+    {
+        var set = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["__Secure-1PSID"] = psid,
+        };
+        if (!string.IsNullOrEmpty(psidts))
+            set["__Secure-1PSIDTS"] = psidts;
+
+        foreach (var (key, value) in shared)
+            set[key] = value;
+
+        return set;
+    }
+
+    /// <summary>
+    /// Builds the candidate session sets the extension sent, one per session id found.
+    /// </summary>
+    /// <remarks>
+    /// A Chrome profile can hold several Google accounts at once. Google then keeps one
+    /// session id per account and only the account that is currently active gets a
+    /// working session on <c>gemini.google.com</c>. The extension cannot tell them
+    /// apart, so the server tries them and keeps the one that resolves to a real
+    /// account.
+    ///
+    /// The grouping is by cookie family, not by path: Google stores every session on
+    /// <c>.google.com</c> at path <c>/</c>. The "1" family (<c>__Secure-1PSID</c>)
+    /// belongs to the account that owns the browser session, the "3" family
+    /// (<c>__Secure-3PSID</c>) to the accounts reached through a third-party context
+    /// such as the Gemini account switcher. Each family carries its own timestamp
+    /// cookie, so the two must be kept apart.
+    /// </remarks>
+    private static List<(Dictionary<string, string> Cookies, string Url)> BuildCandidates(
+        JsonObject payload,
+        string psid,
+        string psidts,
+        IReadOnlyDictionary<string, string> shared)
+    {
+        var candidates = new List<(Dictionary<string, string> Cookies, string Url)>();
+
+        // The session id the extension used, plus its timestamp cookie.
+        candidates.Add((BuildCookieSet(psid, psidts, shared), ""));
+
+        if (payload["variants"] is not JsonArray variants)
+            return candidates;
+
+        // One entry per cookie family: "1" and "3".
+        var ids = new Dictionary<string, (string Psid, string Psidts)>(StringComparer.Ordinal);
+
+        foreach (var item in variants.OfType<JsonObject>())
+        {
+            string name = (string?)item["name"] ?? "";
+            string value = (string?)item["value"] ?? "";
+            if (name.Length == 0 || value.Length == 0)
+                continue;
+
+            string family = FamilyOf(name);
+            if (family.Length == 0)
+                continue;
+
+            if (name.EndsWith("TS", StringComparison.Ordinal))
+            {
+                if (ids.TryGetValue(family, out var existing))
+                    ids[family] = (existing.Psid, value);
+                else
+                    ids[family] = ("", value);
+            }
+            else if (name.EndsWith("PSID", StringComparison.Ordinal))
+            {
+                if (ids.TryGetValue(family, out var existing))
+                    ids[family] = (value, existing.Psidts);
+                else
+                    ids[family] = (value, "");
+            }
+        }
+
+        foreach (var (psidValue, psidtsValue) in ids.Values)
+        {
+            if (psidValue.Length == 0 || string.Equals(psidValue, psid, StringComparison.Ordinal))
+                continue;
+
+            var set = BuildCookieSet(psidValue, psidtsValue, shared);
+
+            // The timestamp of the other family does not belong to this session.
+            foreach (string key in set.Keys.ToList())
+            {
+                if (key.StartsWith("__Secure-3PSID", StringComparison.Ordinal)
+                    && !psidValue.StartsWith("__Secure-3PSID", StringComparison.Ordinal))
+                    set.Remove(key);
+            }
+
+            candidates.Add((set, ""));
+        }
+
+        // The extension also probes the `/u/<n>` paths directly: each Google account
+        // that is not the browser's main one keeps its session on `.google.com` under
+        // its own path, so reading the cookies for that URL yields that account's
+        // session id.
+        if (payload["slots"] is JsonArray slots)
+        {
+            foreach (var slot in slots.OfType<JsonObject>())
+            {
+                string slotPsid = (string?)slot["psid"] ?? "";
+                if (slotPsid.Length == 0 || string.Equals(slotPsid, psid, StringComparison.Ordinal))
+                    continue;
+
+                int slotSlot = (int?)slot["slot"] ?? 0;
+                string slotPsidts = (string?)slot["psidts"] ?? "";
+                string slotPsid3 = (string?)slot["psid3"] ?? "";
+                string slotPsid3ts = (string?)slot["psid3ts"] ?? "";
+
+                var set = BuildCookieSet(slotPsid, slotPsidts, shared);
+                if (slotPsid3.Length > 0)
+                {
+                    set["__Secure-3PSID"] = slotPsid3;
+                    if (slotPsid3ts.Length > 0)
+                        set["__Secure-3PSIDTS"] = slotPsid3ts;
+                }
+
+                candidates.Add((set, $"https://gemini.google.com/u/{slotSlot}/app"));
+            }
+        }
+
+        // Chrome partitions the cookies of every signed-in Google account into its own
+        // store. The extension reads each store separately and sends the session ids
+        // it found, so every account in the profile can be healed from one harvest.
+        if (payload["stores"] is JsonArray stores)
+        {
+            foreach (var store in stores.OfType<JsonObject>())
+            {
+                string storePsid = (string?)store["psid"] ?? "";
+                if (storePsid.Length == 0 || string.Equals(storePsid, psid, StringComparison.Ordinal))
+                    continue;
+
+                string storePsidts = (string?)store["psidts"] ?? "";
+                string storePsid3 = (string?)store["psid3"] ?? "";
+                string storePsid3ts = (string?)store["psid3ts"] ?? "";
+
+                var set = BuildCookieSet(storePsid, storePsidts, shared);
+                if (storePsid3.Length > 0)
+                {
+                    set["__Secure-3PSID"] = storePsid3;
+                    if (storePsid3ts.Length > 0)
+                        set["__Secure-3PSIDTS"] = storePsid3ts;
+                }
+
+                candidates.Add((set, ""));
+            }
+        }
+
+        return candidates;
+    }
+
+    /// <summary>
+    /// Returns the cookie family of a Google session cookie: "1", "3" or "".
+    /// </summary>
+    private static string FamilyOf(string name)
+    {
+        if (name.StartsWith("__Secure-1PSID", StringComparison.Ordinal))
+            return "1";
+        if (name.StartsWith("__Secure-3PSID", StringComparison.Ordinal))
+            return "3";
+        return "";
     }
 
     private static async Task WriteJsonAsync(HttpListenerContext context, int status, JsonObject payload)
@@ -476,4 +756,12 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
         byte[] hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(value));
         return Convert.ToHexString(hash)[..6].ToLowerInvariant();
     }
+
+    /// <summary>First <paramref name="max"/> characters, safe for short strings.</summary>
+    private static string Head(string value, int max) =>
+        value.Length <= max ? value : value[..max];
+
+    /// <summary>Last <paramref name="max"/> characters, safe for short strings.</summary>
+    private static string Tail(string value, int max) =>
+        value.Length <= max ? value : value[^max..];
 }

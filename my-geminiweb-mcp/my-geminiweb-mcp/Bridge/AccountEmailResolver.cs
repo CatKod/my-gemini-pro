@@ -36,18 +36,33 @@ internal sealed partial class AccountEmailResolver(HttpClient? http = null)
     };
 
     /// <summary>
-    /// Returns the email of the Google account behind the given cookies, or <c>null</c>.
+    /// Resolves the Google account email behind the given cookies, or <c>null</c>.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The URL matters. Google serves a different signed-in account per account slot:
+    /// <c>https://gemini.google.com/app</c> is the primary account, while
+    /// <c>https://gemini.google.com/u/1/app</c> is the second one. A request without the
+    /// slot segment therefore always answers for the primary account, no matter which
+    /// cookies are sent — so the caller has to pass the URL of the tab the cookies came
+    /// from.
+    /// </para>
+    /// </remarks>
     /// <param name="cookies">The harvested cookie set.</param>
-    public async Task<string?> ResolveAsync(IReadOnlyDictionary<string, string> cookies)
+    /// <param name="url">The URL to query. Defaults to the primary app URL.</param>
+    public async Task<string?> ResolveAsync(
+        IReadOnlyDictionary<string, string> cookies,
+        string? url = null)
     {
         string header = string.Join("; ", cookies.Select(c => $"{c.Key}={c.Value}"));
         if (header.Length == 0)
             return null;
 
+        string target = NormalizeUrl(url);
+
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, AppUrl);
+            using var request = new HttpRequestMessage(HttpMethod.Get, target);
             request.Headers.TryAddWithoutValidation(
                 "User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -69,6 +84,32 @@ internal sealed partial class AccountEmailResolver(HttpClient? http = null)
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Reduces a tab URL to the URL that identifies its account slot.
+    /// </summary>
+    /// <remarks>
+    /// Only the slot matters. <c>/u/1/app</c> and <c>/u/1/</c> identify the same account,
+    /// so the path is rebuilt from the slot segment alone.
+    /// </remarks>
+    internal static string NormalizeUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return AppUrl;
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return AppUrl;
+
+        if (!uri.Host.EndsWith("gemini.google.com", StringComparison.OrdinalIgnoreCase))
+            return AppUrl;
+
+        var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        string? slot = segments.FirstOrDefault(s => s.Length > 1 && s[0] == 'u' && s[1..].All(char.IsDigit));
+        if (slot is null)
+            return AppUrl;
+
+        return $"https://gemini.google.com/{slot}/app";
     }
 
     /// <summary>

@@ -15,6 +15,13 @@ builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
 
 var paths = AppPaths.Resolve();
 
+// A logger that writes to stderr. stdout carries the MCP protocol, so nothing
+// may be written there.
+ILogger LoggerFor(string category) =>
+    LoggerFactory
+        .Create(b => b.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace))
+        .CreateLogger(category);
+
 // `--bridge-only` runs just the cookie bridge, without the MCP server.
 //
 // Why it exists: an MCP server speaks over stdio, so it lives and dies with the client
@@ -25,7 +32,7 @@ var paths = AppPaths.Resolve();
 if (args.Contains("--bridge-only", StringComparer.OrdinalIgnoreCase))
 {
     var bridgeOnlyPool = AccountPool.Load(paths.PoolFile);
-    using var bridgeOnly = new CookieBridge(bridgeOnlyPool, paths.BridgeTokenFile);
+    using var bridgeOnly = new CookieBridge(bridgeOnlyPool, paths.BridgeTokenFile, LoggerFor("bridge"));
     try
     {
         bridgeOnly.Start(paths.BridgePort);

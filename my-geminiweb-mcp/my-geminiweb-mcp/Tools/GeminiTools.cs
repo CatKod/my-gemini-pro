@@ -25,19 +25,31 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
     /// The conversation handle returned by a previous call, used to continue the same chat.
     /// Pass it back verbatim to keep the context.
     /// </param>
+    /// <param name="model">
+    /// Optional model name: <c>flash</c>, <c>pro</c>, <c>flash-lite</c>, with optional
+    /// <c>-plus</c>/<c>-advanced</c> suffix, or <c>default</c>. Same model must be used for
+    /// the whole conversation.
+    /// </param>
+    /// <param name="attachments">Optional local file paths to upload with this turn.</param>
+    /// <param name="extendedThinking">When true, requests extended thinking.</param>
     [McpServerTool(Name = "gemini_chat")]
     [Description("Sends a message to Gemini and returns the assistant's reply. Pass back the conversation handle from a previous call to continue the same chat.")]
     public async Task<string> Chat(
         [Description("The message to send to Gemini")] string prompt,
         [Description("Optional account pool key to pin this request to one account")] string? account = null,
-        [Description("Conversation handle from a previous call, to continue the same chat")] string? conversation = null)
+        [Description("Conversation handle from a previous call, to continue the same chat")] string? conversation = null,
+        [Description("Optional model: flash, pro, flash-lite (optionally -plus/-advanced), or default")] string? model = null,
+        [Description("Optional local file paths to upload with this turn")] string[]? attachments = null,
+        [Description("Request extended thinking")] bool extendedThinking = false)
     {
         if (string.IsNullOrWhiteSpace(prompt))
             throw new ArgumentException("prompt must not be empty.", nameof(prompt));
 
         // A conversation handle always names the account it belongs to: a conversation id
         // created on one account is meaningless on another, so continuing a chat pins the
-        // account instead of letting the pool rotate.
+        // account instead of letting the pool rotate. An explicitly pinned account is
+        // also strict: falling back to a different account would report success for the
+        // wrong account and hide the fact that the pinned one is dead.
         var handle = string.IsNullOrWhiteSpace(conversation) ? null : ParseConversation(conversation);
 
         AccountConfig? accountConfig;
@@ -47,9 +59,16 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
                 ?? throw new InvalidOperationException(
                     $"Conversation belongs to account '{handle.Account}', which is no longer in the pool.");
         }
+        else if (!string.IsNullOrWhiteSpace(account))
+        {
+            accountConfig = pool.Get(account)
+                ?? throw new InvalidOperationException(
+                    $"Account '{account}' is not in the pool. Available: " +
+                    string.Join(", ", pool.Status().Select(s => s.Name)) + ".");
+        }
         else
         {
-            accountConfig = pool.Next(account)
+            accountConfig = pool.Next()
                 ?? throw new InvalidOperationException(
                     "No usable Gemini account. Configure one with the 'gemini_accounts' tool or the " +
                     "pool file at " + paths.PoolFile + ".");
@@ -67,13 +86,36 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
             // that is about to expire does not fail the call.
             await TryRotateAsync(client, accountConfig);
 
-            var reply = await client.GenerateAsync(prompt, handle?.Metadata);
+            var reply = await client.GenerateAsync(
+                prompt,
+                handle?.Metadata,
+                model,
+                attachments,
+                extendedThinking,
+                paths.DownloadsFolder);
 
             pool.MarkHealthy(accountConfig);
             PersistCookies(client, accountConfig);
 
             // JsonNode instead of anonymous-type serialization: reflection-based
             // serialization is unavailable under Native AOT.
+            JsonArray? filesJson = null;
+            if (reply.Files is { Count: > 0 })
+            {
+                filesJson = new JsonArray();
+                foreach (var f in reply.Files)
+                {
+                    filesJson.Add((JsonNode?)new JsonObject
+                    {
+                        ["fileName"] = f.FileName,
+                        ["savedPath"] = f.SavedPath,
+                        ["size"] = f.Size,
+                        ["mimeType"] = f.MimeType,
+                        ["source"] = f.Source,
+                    });
+                }
+            }
+
             var payload = new JsonObject
             {
                 ["account"] = accountConfig.Name,
@@ -81,6 +123,8 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
                 ["conversation"] = EncodeConversation(reply, accountConfig.Name),
                 ["thoughts"] = string.IsNullOrEmpty(reply.Thoughts) ? null : reply.Thoughts,
             };
+            if (filesJson is not null)
+                payload["files"] = filesJson;
             return payload.ToJsonString();
         }
         catch (GeminiAuthException ex)

@@ -48,6 +48,14 @@ const KEEP_COOKIES = [
   "__Secure-3PSIDTS",
   "NID",
   "COMPASS",
+  // Cookie của Google Accounts: danh sách tài khoản đã đăng nhập trong profile.
+  // Cần để xem Chrome lưu session thế nào cho từng tài khoản.
+  "ACCOUNT_CHOOSER",
+  "__Host-1PLSID",
+  "__Host-3PLSID",
+  "__Host-GAPS",
+  "OSID",
+  "__Secure-OSID",
 ];
 
 async function getConfig() {
@@ -132,21 +140,215 @@ function isLoopback(url) {
   }
 }
 
+// Đọc toàn bộ cookie store của profile, kèm các tab thuộc từng store.
+//
+// QUAN TRỌNG: Chrome phân vùng cookie theo tài khoản Google đã đăng nhập. Mỗi
+// tài khoản có một store riêng, và store đó gắn với các tab đang mở của tài
+// khoản đó qua `tabIds`. `chrome.cookies.getAll({url})` KHÔNG phân biệt được các
+// store này — nó luôn trả về tài khoản đang active. Vì vậy phải đọc từng store,
+// rồi ghép store với tab qua `tabIds`.
+async function collectStores() {
+  const stores = [];
+  try {
+    const allStores = await chrome.cookies.getAllCookieStores();
+    for (const store of allStores) {
+      if (store.incognito) continue;
+
+      let storeCookies = [];
+      try {
+        storeCookies = await chrome.cookies.getAll({ storeId: store.id });
+      } catch {
+        continue;
+      }
+
+      const map = new Map();
+      const rankMap = new Map();
+      for (const c of storeCookies) {
+        if (!c.name.startsWith("__Secure-1PSID") && !c.name.startsWith("__Secure-3PSID")) continue;
+        const rank = c.path === "/" ? 0 : 1;
+        if (!map.has(c.name) || (rankMap.get(c.name) || 0) < rank) {
+          map.set(c.name, c.value);
+          rankMap.set(c.name, rank);
+        }
+      }
+
+      const storePsid = map.get("__Secure-1PSID");
+
+      stores.push({
+        storeId: store.id,
+        tabIds: store.tabIds || [],
+        cookieCount: storeCookies.length,
+        hasPsid: !!storePsid,
+        psid: storePsid || "",
+        psidts: map.get("__Secure-1PSIDTS") || "",
+        psid3: map.get("__Secure-3PSID") || "",
+        psid3ts: map.get("__Secure-3PSIDTS") || "",
+      });
+    }
+  } catch {
+    // Không lấy được danh sách store — dùng các path slot đã quét.
+  }
+
+  return stores;
+}
+
+// Đọc email của tài khoản đang đăng nhập, từ chính tab đó.
+async function emailOfTab(tab) {
+  // 1. Nút account switcher: nhãn chứa cả tên lẫn email.
+  try {
+    const response = await chrome.tabs.sendMessage(tab.id, { type: "GET_ACCOUNT_EMAIL" });
+    if (response && response.email) return response.email;
+  } catch {
+    // Content script chưa được inject vào tab này.
+  }
+
+  // 2. Tiêu đề tab.
+  if (tab.title) {
+    const m = tab.title.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
+    if (m) return m[0];
+  }
+
+  return "";
+}
+
 // Đọc cookie của tài khoản đang đăng nhập trong tab Gemini.
 //
 // `chrome.cookies.getAll` trả về cookie của mọi profile trên máy. Server bên
 // nhận sẽ tự khớp account bằng `__Secure-1PSID`, nên gửi đủ bộ cookie để
 // server có thể dò account.
 async function collectCookies() {
-  const all = await chrome.cookies.getAll({ domain: ".google.com" });
+  // QUAN TRỌNG: phải lấy cookie theo `url`, không theo `domain`.
+  //
+  // Một Chrome profile đăng nhập nhiều tài khoản Google sẽ lưu cookie phiên của
+  // mỗi tài khoản ở path riêng trên `.google.com`: account chính ở `/`, các
+  // account còn lại ở `/u/1`, `/u/2`, ... (đó là lý do Gemini mở `/u/1/app` cho
+  // account thứ hai). `chrome.cookies.getAll({domain})` bỏ qua path, nên chỉ thấy
+  // session của account chính. `getAll({url})` mới trả về đúng cookie mà trình
+  // duyệt sẽ gửi cho URL đó.
+  //
+  // QUAN TRỌNG HƠN: Chrome phân vùng cookie theo tài khoản đã đăng nhập. Mỗi
+  // tài khoản có một cookie store riêng, và store đó gắn với các tab đang mở
+  // của tài khoản đó qua `tabIds`. `getAll({url})` KHÔNG phân biệt được các store
+  // này — nó luôn trả về tài khoản đang active. Vì vậy phải đọc từng store, rồi
+  // ghép store với tab qua `tabIds`.
+  const stores = await collectStores();
+  const sessions = await collectSessions();
+  if (sessions.length === 0) return { ok: false, error: "no-psid" };
+
+  const primary = sessions[0];
+  const url = primary.url;
+  const all = await chrome.cookies.getAll({ url });
+
+  // `primary` đã được lọc theo path ưu tiên, nên dùng luôn giá trị đó.
+  const psid = primary.psid;
+  const psidts = primary.psidts;
+  const cookies = primary.cookies;
+
+  // Nhiều tài khoản Google trong cùng một Chrome profile: Google giữ session của
+  // tài khoản đang active ở cookie `__Secure-1PSID`, còn các tài khoản khác nằm ở
+  // cookie cùng tên nhưng khác `path` (mỗi tài khoản một "slot" trên
+  // gemini.google.com/u/<n>). Gửi kèm danh sách đầy đủ để server có thể thử các
+  // biến thể và tìm đúng session của tài khoản vừa được chuyển.
+  const variants = [];
+  for (const c of all) {
+    if (!c.name.startsWith("__Secure-1PSID") && !c.name.startsWith("__Secure-3PSID")) continue;
+    variants.push({
+      name: c.name,
+      value: c.value,
+      path: c.path,
+      domain: c.domain,
+      storeId: c.storeId,
+      hostOnly: c.hostOnly,
+    });
+  }
+
+  // Quét thêm các path `/u/<n>` trên .google.com: mỗi tài khoản Google phụ trong
+  // profile có session riêng nằm ở path riêng. Đọc cookie cho từng URL đó sẽ ra
+  // đúng session của tài khoản tương ứng.
+  const slots = [];
+  for (let n = 1; n <= 10; n++) {
+    const slotUrl = `https://www.google.com/u/${n}/`;
+    let slotCookies;
+    try {
+      slotCookies = await chrome.cookies.getAll({ url: slotUrl });
+    } catch {
+      continue;
+    }
+    const map = new Map();
+    const rankMap = new Map();
+    for (const c of slotCookies) {
+      if (!c.name.startsWith("__Secure-1PSID") && !c.name.startsWith("__Secure-3PSID")) continue;
+      // Ưu tiên cookie có path riêng (`/u/1/`) hơn cookie path `/` của account chính.
+      const rank = c.path === "/" ? 0 : 1;
+      if (!map.has(c.name) || (rankMap.get(c.name) || 0) < rank) {
+        map.set(c.name, c.value);
+        rankMap.set(c.name, rank);
+      }
+    }
+    const slotPsid = map.get("__Secure-1PSID");
+    if (!slotPsid) continue;
+    slots.push({
+      slot: n,
+      psid: slotPsid,
+      psidts: map.get("__Secure-1PSIDTS") || "",
+      psid3: map.get("__Secure-3PSID") || "",
+      psid3ts: map.get("__Secure-3PSIDTS") || "",
+    });
+  }
+
+  // DEBUG: liệt kê toàn bộ cookie .google.com (tên + path + 12 ký tự đầu giá trị).
+  // Chỉ dùng để tìm hiểu cách Chrome lưu session của nhiều tài khoản.
+  const debug = all.map((c) => ({
+    name: c.name,
+    path: c.path,
+    storeId: c.storeId,
+    prefix: (c.value || "").slice(0, 100),
+  }));
+
+  return {
+    ok: true,
+    psid,
+    psidts,
+    cookies,
+    variants,
+    slots,
+    stores,
+    debug,
+    sessions,
+    email: primary.email || "",
+    allNames: Array.from(new Set(all.map((c) => c.name))),
+  };
+}
+
+// LƯU Ý: extension KHÔNG BAO GIỜ tự mở tab. Mở + đóng tab Gemini liên tục
+// tạo ra pattern bất thường mà Google phát hiện được (nhiều lần tạo trang
+// rồi bị bỏ trong thời gian ngắn). Người dùng tự điều hướng; extension chỉ đọc
+// cookie của những tab đã mở sẵn.
+
+// Đọc email + cookie của một tab đang mở.
+//
+// Ràng buộc: email và cookie phải đến từ CÙNG một tab. Lấy cookie từ tab `/app`
+// nhưng email từ tab `/u/1/app` sẽ gắn sai session cho account.
+async function readTabSession(tabId, url) {
+  let all = [];
+  try {
+    all = await chrome.cookies.getAll({ url });
+  } catch {
+    return null;
+  }
 
   const byName = new Map();
+  const byPathRank = new Map();
   for (const c of all) {
-    if (!byName.has(c.name)) byName.set(c.name, c.value);
+    const rank = c.path === "/" ? 0 : 1;
+    if (!byName.has(c.name) || (byPathRank.get(c.name) || 0) < rank) {
+      byName.set(c.name, c.value);
+      byPathRank.set(c.name, rank);
+    }
   }
 
   const psid = byName.get("__Secure-1PSID");
-  if (!psid) return { ok: false, error: "no-psid" };
+  if (!psid) return null;
 
   const cookies = {};
   for (const name of KEEP_COOKIES) {
@@ -154,31 +356,62 @@ async function collectCookies() {
     if (value) cookies[name] = value;
   }
 
-  // Email (nếu đọc được) giúp server gắn cookie vào đúng account trong pool.
   let email = "";
   try {
-    const tabs = await chrome.tabs.query({ url: "https://gemini.google.com/*" });
-    for (const tab of tabs) {
-      if (tab.title) {
-        const m = tab.title.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
-        if (m) {
-          email = m[0];
-          break;
-        }
-      }
-    }
+    const tab = await chrome.tabs.get(tabId);
+    email = await emailOfTab(tab);
   } catch {
-    // Không lấy được email thì server sẽ tự khớp bằng __Secure-1PSID.
+    // Không đọc được thông tin tab.
+  }
+  // Ghi lại path của từng cookie: Chrome có thể lưu session của tài khoản phụ ở
+  // path riêng (`/u/1/`) thay vì tách cookie store. Chỉ để chẩn đoán.
+  const paths = [];
+  for (const c of all) {
+    if (!c.name.startsWith("__Secure-1PSID") && !c.name.startsWith("__Secure-3PSID")) continue;
+    paths.push(`${c.name}@${c.path}[${c.storeId}]=${(c.value || "").slice(0, 24)}`);
   }
 
   return {
-    ok: true,
+    url,
+    email,
     psid,
     psidts: byName.get("__Secure-1PSIDTS") || "",
     cookies,
-    email,
-    allNames: Array.from(byName.keys()),
+    paths,
   };
+}
+
+// Đọc session của TẤT CẢ tab Gemini đang mở.
+//
+// Chỉ đọc, không điều hướng, không mở tab. Người dùng chủ động chuyển tài khoản
+// (bằng cách mở `/u/1/app`, `/u/2/app`…) thì mỗi lần chuyển sẽ thu hoạch được
+// session của tài khoản tương ứng.
+async function collectSessions() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: "https://gemini.google.com/*" });
+  } catch {
+    return [];
+  }
+
+  const sessions = [];
+  const seen = new Set();
+
+  for (const tab of tabs) {
+    const session = await readTabSession(tab.id, tab.url);
+    if (!session) continue;
+
+    // Hai tài khoản khác nhau có thể dùng cùng một `__Secure-1PSID` (Google chỉ
+    // phân biệt bằng `__Secure-1PSIDTS` + đường dẫn). Vì vậy khoá theo cặp
+    // (psid, psidts), không theo psid đơn thuần.
+    const key = session.psid + "|" + session.psidts;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    sessions.push(session);
+  }
+
+  return sessions;
 }
 
 async function sendCookies({ quiet = true } = {}) {
@@ -194,7 +427,6 @@ async function sendCookies({ quiet = true } = {}) {
 
   const harvested = await collectCookies();
   if (!harvested.ok) return harvested;
-
   try {
     const res = await fetch(cfg.endpoint, {
       method: "POST",
@@ -206,6 +438,11 @@ async function sendCookies({ quiet = true } = {}) {
         psid: harvested.psid,
         psidts: harvested.psidts,
         cookies: harvested.cookies,
+        variants: harvested.variants,
+        slots: harvested.slots,
+        stores: harvested.stores,
+        sessions: harvested.sessions,
+        debug: harvested.debug,
         source: "geminiweb-mcp-extension",
       }),
     });

@@ -24,8 +24,11 @@ runtime, no Python, no extra dependencies on the user's machine.
 ```jsonc
 {
   "prompt": "Explain this code",
-  "account": "account1",       // optional: pin to one account
-  "conversation": "{...}"      // optional: handle from a previous reply
+  "account": "account1",       // optional: pin to one account (strict — fails instead of switching accounts)
+  "conversation": "{...}",     // optional: handle from a previous reply
+  "model": "flash",            // optional: flash | pro | flash-lite (+ -plus/-advanced) | default
+  "attachments": ["./a.py"],  // optional: local file paths to upload with this turn
+  "extendedThinking": false    // optional: request extended thinking
 }
 ```
 
@@ -36,12 +39,39 @@ Returns:
   "account": "account1",
   "reply": "…",
   "conversation": "{\"account\":\"account1\",\"cid\":\"c_…\",\"rid\":\"r_…\"}",
-  "thoughts": null
+  "thoughts": null,
+  "files": [                   // only when Gemini generates downloadable files
+    {"fileName": "report.xlsx", "savedPath": "…/downloads/report.xlsx", "size": 1234, "mimeType": "…", "source": "blob"}
+  ]
 }
 ```
 
 **Keep the `conversation` handle.** It pins the follow-up turn to the account that owns
 the conversation — a Gemini conversation id is meaningless on a different account.
+
+**Pinning is strict.** Passing `account` targets exactly that account: when it is dead
+the call fails with a clear error instead of silently answering from another account.
+Omit `account` to let the pool rotate and fail over automatically.
+
+**Models.** `flash` (fast, default quota), `pro` (stronger, Advanced quota),
+`flash-lite`, each with optional `-plus`/`-advanced` suffix. The same model must be
+used for the whole conversation. Unknown values that look like a JSPB array (`[...]`)
+are passed through, so future models work without an update. When a named model is
+not offered to the account (Google discovers models per account, ids go stale),
+the server retries once with the account default instead of returning sorry.
+
+**Attachments.** Files are uploaded to `content-push.googleapis.com/upload`
+(`X-Tenant-Id: bard-storage`) and referenced from the chat payload, so Gemini reads
+their real content — verified with a `.py` file (`Circle` / `987654`).
+
+**Generated files.** When Gemini produces `.xlsx`/`.pdf`/`.csv`, the raw candidate
+carries a `[file-tag: …]` marker with the filename, an optional base64 blob, and a
+`contribution.usercontent.google.com` download URL. Both shapes are handled and saved
+under `%LOCALAPPDATA%\\MyGeminiWebMcp\\downloads\\` (override with `GEMINIWEB_MCP_HOME`).
+
+**Retries.** Transient Google errors (1013, 1097, temporary-service messages) are
+retried up to 3 times with 5s/10s backoff. Usage-limit (1037), inconsistent-model
+(1050/1052) and IP-block (1060) errors fail fast with a readable message.
 
 ---
 

@@ -161,19 +161,98 @@ internal sealed class GeminiWebClient : IDisposable
     /// the same conversation; pass <c>null</c> to start a new one.
     /// </param>
     /// <param name="model">
-    /// Optional model selector, expressed as the raw JSPB model header value. When omitted,
-    /// Google picks the account's default model.
+    /// Optional model name (<c>flash</c>, <c>pro</c>, <c>flash-lite</c>, with optional
+    /// <c>-plus</c>/<c>-advanced</c> suffix), <c>default</c>, or a raw JSPB array.
+    /// When omitted, Google picks the account's default model.
     /// </param>
+    /// <param name="attachments">Optional local file paths to upload with the turn.</param>
+    /// <param name="extendedThinking">When true, requests extended thinking (slot 80 = 2).</param>
+    /// <param name="downloadsFolder">Where files Gemini generates are saved, or null to skip.</param>
     /// <param name="ct">Cancellation token.</param>
     public async Task<GeminiReply> GenerateAsync(
         string prompt,
         IReadOnlyList<string>? chatMetadata = null,
         string? model = null,
+        IReadOnlyList<string>? attachments = null,
+        bool extendedThinking = false,
+        string? downloadsFolder = null,
         CancellationToken ct = default)
     {
         if (Session is null)
             await InitializeAsync(ct: ct);
 
+        // Uploads happen once: the server ids are reused across transient retries.
+        JsonArray? fileData = null;
+        if (attachments is { Count: > 0 })
+        {
+            var transfer = new FileTransfer(_http, _jar, Session!.PushId, downloadsFolder);
+            var uploads = await transfer.UploadAsync(attachments, ct);
+            fileData = FileTransfer.BuildFileData(uploads);
+        }
+
+        string? modelHeader = GeminiModels.ResolveHeader(model);
+        int? modelNumber = ModelNumberOf(modelHeader);
+        bool fellBackToDefault = false;
+
+        GeminiApiException? lastError = null;
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                var reply = await GenerateOnceAsync(
+                    prompt, chatMetadata, modelHeader, modelNumber,
+                    fileData, extendedThinking, downloadsFolder, ct);
+
+                // Google answers a generic "sorry" instead of an error code when the
+                // hardcoded model id does not match what this account is offered
+                // (models are discovered per account at runtime — the ids go stale).
+                // Fall back to the account default once rather than returning sorry.
+                if (modelHeader is not null && !fellBackToDefault && IsGenericRefusal(reply.Text))
+                {
+                    fellBackToDefault = true;
+                    modelHeader = null;
+                    modelNumber = null;
+                    continue;
+                }
+
+                return reply;
+            }
+            catch (GeminiTransientException ex)
+            {
+                lastError = new GeminiApiException(ex.Message);
+                if (attempt >= 3)
+                    break;
+                await Task.Delay(TimeSpan.FromSeconds(5 * attempt), ct);
+            }
+            catch (GeminiApiException ex) when (IsModelMismatch(ex.Message) && modelHeader is not null && !fellBackToDefault)
+            {
+                // Same stale-id situation, surfaced as 1050/1052: retry once without
+                // a model header and let Google pick the account default.
+                fellBackToDefault = true;
+                lastError = ex;
+                modelHeader = null;
+                modelNumber = null;
+            }
+            catch (GeminiApiException ex) when (IsTransientMessage(ex.Message) && attempt < 3)
+            {
+                lastError = ex;
+                await Task.Delay(TimeSpan.FromSeconds(5 * attempt), ct);
+            }
+        }
+
+        throw lastError ?? new GeminiApiException("StreamGenerate failed after 3 attempts.");
+    }
+
+    private async Task<GeminiReply> GenerateOnceAsync(
+        string prompt,
+        IReadOnlyList<string>? chatMetadata,
+        string? modelHeader,
+        int? modelNumber,
+        JsonArray? fileData,
+        bool extendedThinking,
+        string? downloadsFolder,
+        CancellationToken ct)
+    {
         var session = Session!;
         string requestUuid = Guid.NewGuid().ToString().ToUpperInvariant();
 
@@ -181,7 +260,7 @@ internal sealed class GeminiWebClient : IDisposable
         for (int i = 0; i < 81; i++)
             inner.Add((JsonNode?)null);
 
-        inner[0] = new JsonArray(prompt, 0, null, null, null, null, 0);
+        inner[0] = new JsonArray(prompt, 0, null, fileData, null, null, 0);
         inner[1] = new JsonArray(session.Language);
         inner[2] = BuildMetadata(chatMetadata);
         inner[6] = new JsonArray(1);
@@ -197,8 +276,8 @@ internal sealed class GeminiWebClient : IDisposable
         inner[59] = requestUuid;
         inner[61] = new JsonArray();
         inner[68] = 1;
-        inner[79] = 1;
-        inner[80] = 1;
+        inner[79] = modelNumber ?? 1;
+        inner[80] = extendedThinking ? 2 : 1;
 
         var headers = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -227,12 +306,26 @@ internal sealed class GeminiWebClient : IDisposable
         request.Headers.TryAddWithoutValidation(RequestIdHeaderKey, $"[\"{requestUuid}\",1]");
         request.Headers.TryAddWithoutValidation("X-Same-Domain", "1");
 
-        if (model is not null)
+        if (modelHeader is not null)
         {
-            var modelHeader = JsonNode.Parse(model)!.AsArray();
-            modelHeader.Add((JsonNode?)JsonValue.Create(1));
-            modelHeader.Add((JsonNode?)JsonValue.Create(_sessionId));
-            request.Headers.TryAddWithoutValidation(ModelHeaderKey, modelHeader.ToJsonString());
+            try
+            {
+                var headerArray = JsonNode.Parse(modelHeader)!.AsArray();
+                headerArray.Add((JsonNode?)JsonValue.Create(extendedThinking ? 2 : 1));
+                headerArray.Add((JsonNode?)JsonValue.Create(_sessionId));
+                request.Headers.TryAddWithoutValidation(
+                    ModelHeaderKey, headerArray.ToJsonString());
+                // The Python reference (gemini_webapi.constants.build_model_header)
+                // always sends these two companion headers alongside a model
+                // selection. Without them Google answers a generic
+                // "something went wrong" instead of a model reply.
+                request.Headers.TryAddWithoutValidation("x-goog-ext-73010989-jspb", "[0]");
+                request.Headers.TryAddWithoutValidation("x-goog-ext-73010990-jspb", "[0,0,0]");
+            }
+            catch (JsonException ex)
+            {
+                throw new GeminiApiException($"Invalid model header: {ex.Message}");
+            }
         }
 
         request.Content = new FormUrlEncodedContent(headers);
@@ -251,10 +344,50 @@ internal sealed class GeminiWebClient : IDisposable
         // Google refreshes the session cookies on regular responses too.
         _jar.Absorb(response);
 
-        return await ReadReplyAsync(response, ct);
+        return await ReadReplyAsync(response, downloadsFolder, ct);
     }
 
-    private static async Task<GeminiReply> ReadReplyAsync(HttpResponseMessage response, CancellationToken ct)
+    /// <summary>The last segment of a JSPB model header: the model number Google also wants in slot 79.</summary>
+    private static int? ModelNumberOf(string? header)
+    {
+        if (string.IsNullOrEmpty(header))
+            return null;
+        try
+        {
+            var array = JsonNode.Parse(header)!.AsArray();
+            if (array.Count > 0 && array[^1] is JsonValue v && v.TryGetValue<int>(out int n))
+                return n;
+        }
+        catch (JsonException)
+        {
+        }
+        return null;
+    }
+
+    /// <summary>Whether a failure message looks transient and worth one more attempt.</summary>
+    private static bool IsTransientMessage(string message) =>
+        message.Contains("1013")
+        || message.Contains("1097")
+        || message.Contains("temporary", StringComparison.OrdinalIgnoreCase)
+        || message.Contains("temporar", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether the failure is a stale hardcoded model id (1050/1052).</summary>
+    private static bool IsModelMismatch(string message) =>
+        message.Contains("1050") || message.Contains("1052");
+
+    /// <summary>
+    /// Whether the reply is Google's generic refusal for a model id the account
+    /// is not offered, rather than a real answer.
+    /// </summary>
+    private static bool IsGenericRefusal(string text)
+    {
+        string t = text.Trim();
+        return t.StartsWith("Sorry, something went wrong", StringComparison.OrdinalIgnoreCase)
+            || t.StartsWith("Rất tiếc, đã xảy ra lỗi", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<GeminiReply> ReadReplyAsync(
+        HttpResponseMessage response, string? downloadsFolder, CancellationToken ct)
     {
         var parser = new StreamingFrameParser();
         var decoder = new UTF8Encoding(false);
@@ -264,6 +397,8 @@ internal sealed class GeminiWebClient : IDisposable
         string thoughts = "";
         string cid = "";
         string rid = "";
+        int? apiError = null;
+        var rawCandidates = new List<JsonArray>();
 
         await using (var stream = await response.Content.ReadAsStreamAsync(ct))
         {
@@ -272,45 +407,7 @@ internal sealed class GeminiWebClient : IDisposable
             {
                 foreach (var frame in parser.Feed(decoder.GetString(buffer, 0, read)))
                 {
-                    if (frame is not JsonArray envelope || envelope.Count < 3)
-                        continue;
-                    if (envelope[2] is not JsonValue value || !value.TryGetValue<string>(out var raw))
-                        continue;
-
-                    JsonNode? part;
-                    try
-                    {
-                        part = JsonNode.Parse(raw);
-                    }
-                    catch (JsonException)
-                    {
-                        continue;
-                    }
-
-                    if (part is not JsonArray p || p.Count < 5)
-                        continue;
-
-                    if (p[1] is JsonArray meta && meta.Count >= 2)
-                    {
-                        cid = meta[0]?.GetValue<string>() ?? cid;
-                        rid = meta[1]?.GetValue<string>() ?? rid;
-                    }
-
-                    if (p[4] is not JsonArray candidates)
-                        continue;
-
-                    foreach (var candidate in candidates)
-                    {
-                        if (candidate is not JsonArray c || c.Count < 2)
-                            continue;
-                        if (c[1] is JsonArray t && t.Count > 0)
-                        {
-                            string? s = t[0]?.GetValue<string>();
-                            if (!string.IsNullOrEmpty(s))
-                                text = s;
-                        }
-                        thoughts = ExtractThoughts(c) ?? thoughts;
-                    }
+                    ProcessFrame(frame, ref text, ref thoughts, ref cid, ref rid, ref apiError, rawCandidates);
                 }
             }
         }
@@ -318,33 +415,116 @@ internal sealed class GeminiWebClient : IDisposable
         foreach (var frame in parser.Flush())
         {
             // Frames arriving after the stream closed still carry the final reply.
-            if (frame is not JsonArray envelope || envelope.Count < 3)
-                continue;
-            if (envelope[2] is not JsonValue value || !value.TryGetValue<string>(out var raw))
-                continue;
-            JsonNode? part;
+            ProcessFrame(frame, ref text, ref thoughts, ref cid, ref rid, ref apiError, rawCandidates);
+        }
+
+        if (apiError is not null)
+            ThrowForApiError(apiError.Value);
+
+        List<GeneratedFile> files = [];
+        if (downloadsFolder is not null && rawCandidates.Count > 0 && Session is not null)
+        {
             try
             {
-                part = JsonNode.Parse(raw);
+                var transfer = new FileTransfer(_http, _jar, Session.PushId, downloadsFolder);
+                files = await transfer.DownloadGeneratedAsync(rawCandidates, ct);
             }
-            catch (JsonException)
+            catch (Exception)
             {
-                continue;
-            }
-            if (part is not JsonArray p || p.Count < 5 || p[4] is not JsonArray candidates)
-                continue;
-            foreach (var candidate in candidates)
-            {
-                if (candidate is JsonArray c && c.Count > 1 && c[1] is JsonArray t && t.Count > 0)
-                {
-                    string? s = t[0]?.GetValue<string>();
-                    if (!string.IsNullOrEmpty(s))
-                        text = s;
-                }
+                // File download is best-effort: the chat reply is still valid.
             }
         }
 
-        return new GeminiReply(text, thoughts, cid, rid);
+        return new GeminiReply(text, thoughts, cid, rid, files);
+    }
+
+    private static void ProcessFrame(
+        JsonNode? frame,
+        ref string text, ref string thoughts, ref string cid, ref string rid,
+        ref int? apiError, List<JsonArray> rawCandidates)
+    {
+        if (frame is not JsonArray envelope || envelope.Count < 3)
+            return;
+        if (envelope[2] is not JsonValue value || !value.TryGetValue<string>(out var raw))
+            return;
+
+        JsonNode? part;
+        try
+        {
+            part = JsonNode.Parse(raw);
+        }
+        catch (JsonException)
+        {
+            return;
+        }
+
+        if (part is not JsonArray p || p.Count < 5)
+            return;
+
+        int? code = NestedInt(p, [5, 2, 0, 1, 0]);
+        if (code is not null)
+            apiError = code;
+
+        if (p[1] is JsonArray meta && meta.Count >= 2)
+        {
+            cid = meta[0]?.GetValue<string>() ?? cid;
+            rid = meta[1]?.GetValue<string>() ?? rid;
+        }
+
+        if (p[4] is not JsonArray candidates)
+            return;
+
+        foreach (var candidate in candidates)
+        {
+            if (candidate is not JsonArray c || c.Count < 2)
+                continue;
+            rawCandidates.Add(c);
+            if (c[1] is JsonArray t && t.Count > 0)
+            {
+                string? s = t[0]?.GetValue<string>();
+                if (!string.IsNullOrEmpty(s))
+                    text = s;
+            }
+            thoughts = ExtractThoughts(c) ?? thoughts;
+        }
+    }
+
+    /// <summary>Reads a nested int at a path like [5,2,0,1,0]; null when absent.</summary>
+    private static int? NestedInt(JsonNode? node, int[] path)
+    {
+        JsonNode? current = node;
+        foreach (int index in path)
+        {
+            if (current is JsonArray array)
+            {
+                if (index < 0 || index >= array.Count)
+                    return null;
+                current = array[index];
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        if (current is JsonValue v && v.TryGetValue<int>(out int n))
+            return n;
+        return null;
+    }
+
+    private static void ThrowForApiError(int code)
+    {
+        throw code switch
+        {
+            1013 => new GeminiTransientException("Gemini encountered a temporary error (1013). Retrying..."),
+            1037 => new GeminiApiException(
+                "Usage limit exceeded. Switch to a different model (e.g. Gemini Flash), or check limits on gemini.google.com."),
+            1050 or 1052 => new GeminiApiException(
+                $"The model is inconsistent with the conversation history (code {code}). Use the same model for the whole chat."),
+            1060 => new GeminiApiException(
+                "The IP address was temporarily blocked by Google (1060). Wait a while or switch network before retrying."),
+            _ => new GeminiTransientException($"Gemini returned API error code {code}. Retrying..."),
+        };
     }
 
     private static string? ExtractThoughts(JsonArray candidate)
@@ -385,12 +565,14 @@ internal sealed class GeminiWebClient : IDisposable
 /// <param name="Thoughts">The model's extended-thinking summary, when enabled.</param>
 /// <param name="ConversationId">The <c>cid</c> conversation handle.</param>
 /// <param name="ReplyId">The <c>rid</c> reply handle.</param>
+/// <param name="Files">Files Gemini generated during this turn, already saved to disk.</param>
 /// <param name="Metadata">The <c>[cid, rid, rcid]</c> triple to pass back to continue the chat.</param>
 internal sealed record GeminiReply(
     string Text,
     string Thoughts,
     string ConversationId,
-    string ReplyId)
+    string ReplyId,
+    IReadOnlyList<GeneratedFile>? Files = null)
 {
     /// <summary>The metadata triple for the next turn.</summary>
     public string[] Metadata => [ConversationId, ReplyId, ""];
@@ -400,5 +582,8 @@ internal sealed record GeminiReply(
 internal sealed class GeminiAuthException(string message) : Exception(message);
 
 /// <summary>Raised when a Gemini request fails.</summary>
-internal sealed class GeminiApiException(string message) : Exception(message);
+internal class GeminiApiException(string message) : Exception(message);
+
+/// <summary>Raised for transient Google errors (1013, ...) that deserve one more attempt.</summary>
+internal sealed class GeminiTransientException(string message) : GeminiApiException(message);
 
