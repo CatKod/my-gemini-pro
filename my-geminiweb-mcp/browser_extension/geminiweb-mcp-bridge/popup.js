@@ -12,16 +12,26 @@ function setStatus(text, cls) {
 }
 
 async function loadSaved() {
-  const saved = await chrome.storage.local.get(["endpoint", "token", "autoSend", "account"]);
+  const saved = await chrome.storage.local.get(["endpoint", "token", "autoSend", "account", "lastSync", "lastResult"]);
   if (saved.endpoint) el("endpoint").value = saved.endpoint;
   if (saved.token) el("token").value = saved.token;
   if (saved.account) el("account").value = saved.account;
   // Auto-send is on unless the user explicitly turned it off.
   el("auto").checked = saved.autoSend !== false;
+
+  const syncLine = el("sync");
+  if (saved.lastSync) {
+    const when = new Date(saved.lastSync);
+    const ts = isNaN(when.getTime()) ? saved.lastSync : when.toLocaleString("vi-VN");
+    syncLine.textContent = "Đồng bộ gần nhất: " + ts + (saved.lastResult ? " — " + saved.lastResult : "");
+  } else {
+    syncLine.textContent = "Chưa có lần đồng bộ nào.";
+  }
+
   if (saved.token) {
     setStatus(
       el("auto").checked
-        ? "Đã bật chế độ tự động — mỗi khi bạn mở tab Gemini, cookie tự được gửi."
+        ? "Đã bật chế độ tự động — cookie được gửi mỗi 20 phút và khi bạn mở tab Gemini."
         : "Đã lưu token. Bấm 'Gửi cookie' để gửi ngay, hoặc bật chế độ tự động.",
       "ok"
     );

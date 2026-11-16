@@ -59,7 +59,7 @@ const KEEP_COOKIES = [
 ];
 
 async function getConfig() {
-  const cfg = await chrome.storage.local.get(["endpoint", "token", "autoSend", "account"]);
+  const cfg = await chrome.storage.local.get(["endpoint", "token", "autoSend", "account", "lastSync", "lastResult"]);
   return {
     endpoint: cfg.endpoint || "",
     token: cfg.token || "",
@@ -68,7 +68,20 @@ async function getConfig() {
     // expires. The popup toggle turns it off.
     autoSend: cfg.autoSend !== false,
     account: cfg.account || "",
+    lastSync: cfg.lastSync || "",
+    lastResult: cfg.lastResult || "",
   };
+}
+
+// Chu ky dong bo ngam: 20 phut — khop voi SessionKeepAlive cua server (~20p).
+const AUTO_SYNC_MINUTES = 20;
+
+async function ensureAutoSync() {
+  try {
+    await chrome.alarms.create("geminiweb-sync", { periodInMinutes: AUTO_SYNC_MINUTES });
+  } catch {
+    // Trinh duyet cu khong co alarms — bo qua, van con che do gui khi mo tab.
+  }
 }
 
 // Dò port của bridge: thử `/ping` trên các port ứng viên.
@@ -320,6 +333,125 @@ async function collectCookies() {
   };
 }
 
+// Doc cookie ma khong can tab nao mo — dung cho alarms chay ngam.
+//
+// Tab co the khong co (Chrome chay nen ma khong mo Gemini). chrome.cookies
+// van doc duoc vi no chay TRONG browser. Email de server tu resolve qua
+// slot URL; neu co tab Gemini mo thi van kem sessions de ghep email chinh xac.
+async function collectCookiesTabless() {
+  let all = [];
+  try {
+    all = await chrome.cookies.getAll({ url: "https://gemini.google.com/app" });
+  } catch {
+    return { ok: false, error: "no-psid" };
+  }
+
+  const byName = new Map();
+  const byPathRank = new Map();
+  for (const c of all) {
+    const rank = c.path === "/" ? 0 : 1;
+    if (!byName.has(c.name) || (byPathRank.get(c.name) || 0) < rank) {
+      byName.set(c.name, c.value);
+      byPathRank.set(c.name, rank);
+    }
+  }
+
+  const psid = byName.get("__Secure-1PSID");
+  if (!psid) return { ok: false, error: "no-psid" };
+
+  const cookies = {};
+  for (const name of KEEP_COOKIES) {
+    const value = byName.get(name);
+    if (value) cookies[name] = value;
+  }
+
+  const variants = [];
+  for (const c of all) {
+    if (!c.name.startsWith("__Secure-1PSID") && !c.name.startsWith("__Secure-3PSID")) continue;
+    variants.push({
+      name: c.name,
+      value: c.value,
+      path: c.path,
+      domain: c.domain,
+      storeId: c.storeId,
+      hostOnly: c.hostOnly,
+    });
+  }
+
+  const slots = [];
+  for (let n = 1; n <= 10; n++) {
+    const slotUrl = `https://www.google.com/u/${n}/`;
+    let slotCookies;
+    try {
+      slotCookies = await chrome.cookies.getAll({ url: slotUrl });
+    } catch {
+      continue;
+    }
+    const map = new Map();
+    const rankMap = new Map();
+    for (const c of slotCookies) {
+      if (!c.name.startsWith("__Secure-1PSID") && !c.name.startsWith("__Secure-3PSID")) continue;
+      const rank = c.path === "/" ? 0 : 1;
+      if (!map.has(c.name) || (rankMap.get(c.name) || 0) < rank) {
+        map.set(c.name, c.value);
+        rankMap.set(c.name, rank);
+      }
+    }
+    const slotPsid = map.get("__Secure-1PSID");
+    if (!slotPsid) continue;
+    slots.push({
+      slot: n,
+      psid: slotPsid,
+      psidts: map.get("__Secure-1PSIDTS") || "",
+      psid3: map.get("__Secure-3PSID") || "",
+      psid3ts: map.get("__Secure-3PSIDTS") || "",
+    });
+  }
+
+  // Co tab nao mo thi kem sessions de server ghep email chinh xac.
+  // Khong co tab cung khong sao: server tu resolve email qua slot URL.
+  let sessions = [];
+  try {
+    sessions = await collectSessions();
+  } catch {
+    sessions = [];
+  }
+
+  const stores = await collectStores();
+  const debug = all.map((c) => ({
+    name: c.name,
+    path: c.path,
+    storeId: c.storeId,
+    prefix: (c.value || "").slice(0, 100),
+  }));
+
+  return {
+    ok: true,
+    psid,
+    psidts: byName.get("__Secure-1PSIDTS") || "",
+    cookies,
+    variants,
+    slots,
+    stores,
+    debug,
+    sessions,
+    email: sessions.length > 0 ? (sessions[0].email || "") : "",
+    allNames: Array.from(new Set(all.map((c) => c.name))),
+    tabless: true,
+  };
+}
+
+async function recordSync(ok, detail) {
+  try {
+    await chrome.storage.local.set({
+      lastSync: new Date().toISOString(),
+      lastResult: ok ? ("OK" + (detail ? " — " + detail : "")) : ("Lỗi: " + (detail || "?")),
+    });
+  } catch {
+    // Storage loi thi bo qua — lan sau ghi lai.
+  }
+}
+
 // LƯU Ý: extension KHÔNG BAO GIỜ tự mở tab. Mở + đóng tab Gemini liên tục
 // tạo ra pattern bất thường mà Google phát hiện được (nhiều lần tạo trang
 // rồi bị bỏ trong thời gian ngắn). Người dùng tự điều hướng; extension chỉ đọc
@@ -441,7 +573,10 @@ async function sendCookies({ quiet = true } = {}) {
     return { ok: false, error: "bad-endpoint" };
   }
 
-  const harvested = await collectCookies();
+  // Tabless truoc: doc thang cookie store ma khong can tab mo.
+  // Che do nay chay duoc trong alarms (khong can tab Gemini nao mo).
+  let harvested = await collectCookiesTabless();
+  if (!harvested.ok) harvested = await collectCookies();
   if (!harvested.ok) return harvested;
   try {
     const res = await fetch(cfg.endpoint, {
@@ -495,7 +630,46 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     const discovered = await resolveEndpoint();
     if (!discovered.token) return;
   }
-  await sendCookies({ quiet: true });
+  const r = await sendCookies({ quiet: true });
+  const d = (r && r.data) || {};
+  await recordSync(
+    !!(r && r.ok),
+    r && r.ok
+      ? "đã lưu " + ((d.accounts && d.accounts.length) ? d.accounts.join(", ") : d.account || "?")
+      : (r && (r.error || "gửi thất bại"))
+  );
+});
+
+// Đồng bộ ngầm theo chu kỳ: KHÔNG cần người dùng bấm popup, không cần mở
+// tab Gemini. Service worker của Chrome tự thức dậy theo alarm, đọc cookie
+// trong browser rồi POST về bridge local.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (!alarm || alarm.name !== "geminiweb-sync") return;
+  const cfg = await getConfig();
+  if (!cfg.autoSend) return;
+
+  // Tự tìm endpoint/token nếu chưa có (sau khi browser restart, storage vẫn
+  // còn nhưng token có thể đã đổi).
+  let endpoint = cfg.endpoint;
+  let token = cfg.token;
+  if (!token) {
+    const discovered = await resolveEndpoint();
+    endpoint = discovered.endpoint;
+    token = discovered.token;
+  }
+  if (!token || !endpoint) {
+    await recordSync(false, "chưa tìm thấy bridge local");
+    return;
+  }
+
+  const r = await sendCookies({ quiet: true });
+  const d = (r && r.data) || {};
+  await recordSync(
+    !!(r && r.ok),
+    r && r.ok
+      ? "đã lưu " + ((d.accounts && d.accounts.length) ? d.accounts.join(", ") : d.account || "?")
+      : (r && (r.error || "gửi thất bại"))
+  );
 });
 
 // Khi extension vừa được cài (hoặc reload), tự tìm server và lấy token.
@@ -503,10 +677,28 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 // mở một tab Gemini là cookie được gửi.
 chrome.runtime.onInstalled.addListener(async () => {
   await resolveEndpoint();
+  await ensureAutoSync();
+  // Đồng bộ ngay lần đầu để pool có cookie sẵn, không phải chờ 20 phút.
+  const cfg = await getConfig();
+  if (cfg.autoSend) {
+    const r = await sendCookies({ quiet: true });
+    const d = (r && r.data) || {};
+    await recordSync(
+      !!(r && r.ok),
+      r && r.ok
+        ? "đã lưu " + ((d.accounts && d.accounts.length) ? d.accounts.join(", ") : d.account || "?")
+        : (r && (r.error || "gửi thất bại"))
+    );
+  }
 });
 chrome.runtime.onStartup.addListener(async () => {
   await resolveEndpoint();
+  await ensureAutoSync();
 });
+
+// Service worker có thể bị Chrome đóng và khởi động lại — đảm bảo alarm còn
+// tồn tại mỗi khi worker thức dậy.
+ensureAutoSync();
 
 // Cho popup gọi lại (nút "Gửi cookie" dùng chung logic).
 chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
