@@ -97,8 +97,11 @@ async function send() {
     const res = await chrome.runtime.sendMessage({ type: "SEND_COOKIES" });
     if (res && res.ok) {
       const d = res.data || {};
+      const all = Array.isArray(d.accounts) && d.accounts.length > 0
+        ? d.accounts.join(", ")
+        : (d.account || "?");
       setStatus(
-        "OK — đã lưu vào account '" + (d.account || "?") + "'\n" +
+        "OK — đã lưu: " + all + "\n" +
         "Số cookie: " + (d.cookieCount || "?") +
         "\nCó __Secure-1PSIDTS: " + (d.hasPsidts ? "có" : "không"),
         "ok"

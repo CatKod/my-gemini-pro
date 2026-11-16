@@ -386,12 +386,28 @@ async function readTabSession(tabId, url) {
 // Chỉ đọc, không điều hướng, không mở tab. Người dùng chủ động chuyển tài khoản
 // (bằng cách mở `/u/1/app`, `/u/2/app`…) thì mỗi lần chuyển sẽ thu hoạch được
 // session của tài khoản tương ứng.
+//
+// Tab đang active được xếp đầu tiên: đó chính là tab người dùng vừa bấm
+// "Gửi cookie", nên server lấy nó làm `primary` trong kết quả trả về.
 async function collectSessions() {
   let tabs = [];
   try {
     tabs = await chrome.tabs.query({ url: "https://gemini.google.com/*" });
   } catch {
     return [];
+  }
+
+  // Tab active (tab người dùng đang nhìn) — ưu tiên lên đầu để `primary`
+  // chính là tài khoản vừa bấm gửi, không phải tab mở đầu tiên.
+  let activeId = 0;
+  try {
+    const active = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (active && active.length > 0 && active[0] && active[0].id) activeId = active[0].id;
+  } catch {
+    // Không lấy được tab active — giữ thứ tự cũ.
+  }
+  if (activeId) {
+    tabs = [...tabs].sort((a, b) => (b.id === activeId) - (a.id === activeId));
   }
 
   const sessions = [];
