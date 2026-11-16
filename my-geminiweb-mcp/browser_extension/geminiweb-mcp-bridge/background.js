@@ -19,7 +19,25 @@ const GEMINI_HOSTS = ["gemini.google.com", "accounts.google.com"];
 // port mặc định bị chiếm (ví dụ instance cũ chưa tắt), nên extension phải dò
 // thay vì hard-code.
 const DEFAULT_PORT = 9478;
-const PORT_SCAN_RANGE = 20;
+
+// Bề rộng dải dò. Dải rộng vì port có thể đã được cấu hình (biến môi trường
+// GEMINIWEB_MCP_BRIDGE_PORT), nên đừng giả định nó nằm ngay cạnh mặc định.
+const PORT_SCAN_RANGE = 100;
+
+// Dải port để dò.
+//
+// Thứ tự ưu tiên: port trong storage (người dùng đã cấu hình) → port mặc định.
+// Một dải rộng vì port có thể đã được cấu hình qua biến môi trường
+// GEMINIWEB_MCP_BRIDGE_PORT, nên đừng giả định nó nằm ngay cạnh mặc định.
+function portCandidates(savedPort) {
+  const start = Number(savedPort) || DEFAULT_PORT;
+  const list = [];
+  for (let port = start; port < start + PORT_SCAN_RANGE; port++) list.push(port);
+  for (let port = DEFAULT_PORT; port < DEFAULT_PORT + PORT_SCAN_RANGE; port++) {
+    if (!list.includes(port)) list.push(port);
+  }
+  return list;
+}
 
 // Cookie được giữ lại khi gửi đi. `NID` và họ `__Secure-3PSID*` phải đi kèm:
 // session chỉ có `__Secure-1PSID` sẽ bị Google từ chối.
@@ -37,15 +55,18 @@ async function getConfig() {
   return {
     endpoint: cfg.endpoint || "",
     token: cfg.token || "",
-    autoSend: cfg.autoSend === true,
+    // Auto-send is on by default: the point of the bridge is that the pool heals
+    // itself, so the user should not have to press a button every time a session
+    // expires. The popup toggle turns it off.
+    autoSend: cfg.autoSend !== false,
     account: cfg.account || "",
   };
 }
 
-// Dò port của bridge: thử `/ping` trên port mặc định rồi các port kế tiếp.
+// Dò port của bridge: thử `/ping` trên các port ứng viên.
 // Trả về `{baseUrl, port}` của server đang sống, hoặc null.
-async function discoverBridge() {
-  for (let port = DEFAULT_PORT; port < DEFAULT_PORT + PORT_SCAN_RANGE; port++) {
+async function discoverBridge(savedPort) {
+  for (const port of portCandidates(savedPort)) {
     const base = `http://127.0.0.1:${port}`;
     try {
       const res = await fetch(base + "/ping", { method: "GET" });
@@ -83,7 +104,8 @@ async function resolveEndpoint() {
   const cfg = await getConfig();
   if (cfg.token && cfg.endpoint) return cfg;
 
-  const found = await discoverBridge();
+  const savedPort = Number((cfg.endpoint || "").split(":")[2]) || 0;
+  const found = await discoverBridge(savedPort);
   if (!found) return cfg;
 
   const remote = await fetchBridgeConfig(found.baseUrl);
@@ -213,8 +235,24 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
   if (!GEMINI_HOSTS.includes(host)) return;
   const cfg = await getConfig();
-  if (!cfg.autoSend || !cfg.token) return;
+  if (!cfg.autoSend) return;
+  // The token is discovered on the first attempt, so a fresh install works
+  // without the user ever opening the popup.
+  if (!cfg.token) {
+    const discovered = await resolveEndpoint();
+    if (!discovered.token) return;
+  }
   await sendCookies({ quiet: true });
+});
+
+// Khi extension vừa được cài (hoặc reload), tự tìm server và lấy token.
+// Điều này làm cho lần cài đặt đầu tiên không cần thao tác tay: chỉ cần
+// mở một tab Gemini là cookie được gửi.
+chrome.runtime.onInstalled.addListener(async () => {
+  await resolveEndpoint();
+});
+chrome.runtime.onStartup.addListener(async () => {
+  await resolveEndpoint();
 });
 
 // Cho popup gọi lại (nút "Gửi cookie" dùng chung logic).
@@ -249,7 +287,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
         }
       }
       // Chưa cấu hình → dò port rồi lấy config.
-      const found = await discoverBridge();
+      const found = await discoverBridge(
+        Number((cfg.endpoint || "").split(":")[2]) || 0
+      );
       if (found) {
         const remote = await fetchBridgeConfig(found.baseUrl);
         if (remote) {

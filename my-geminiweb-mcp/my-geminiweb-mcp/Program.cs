@@ -28,7 +28,7 @@ if (args.Contains("--bridge-only", StringComparer.OrdinalIgnoreCase))
     using var bridgeOnly = new CookieBridge(bridgeOnlyPool, paths.BridgeTokenFile);
     try
     {
-        bridgeOnly.Start();
+        bridgeOnly.Start(paths.BridgePort);
     }
     catch (Exception ex)
     {
@@ -51,7 +51,7 @@ var pool = AccountPool.Load(paths.PoolFile);
 var bridge = new CookieBridge(pool, paths.BridgeTokenFile);
 try
 {
-    bridge.Start();
+    bridge.Start(paths.BridgePort);
 }
 catch (Exception ex)
 {

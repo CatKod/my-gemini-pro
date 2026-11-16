@@ -31,6 +31,20 @@ PORT = 9478
 ENDPOINT = f"http://127.0.0.1:{PORT}/harvest"
 
 
+def next_free_port(start=9800, count=60):
+    """A free TCP port, so two test runs never fight over the same one."""
+    import socket
+
+    for port in range(start, start + count):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("no free port found")
+
+
 def log(msg):
     print(msg, flush=True)
 
@@ -49,10 +63,17 @@ def fresh_home(name):
     return home
 
 
-def start_server(home):
-    """Starts the server and returns (process, token, endpoint)."""
+def start_server(home, port=None):
+    """Starts the server and returns (process, token, endpoint).
+
+    The bridge port is pinned so a test run cannot attach to — or be discovered by —
+    a bridge the user is already running, which would write into the real pool.
+    """
     env = dict(os.environ)
     env["GEMINIWEB_MCP_HOME"] = str(home)
+    if port is None:
+        port = next_free_port()
+    env["GEMINIWEB_MCP_BRIDGE_PORT"] = str(port)
 
     proc = subprocess.Popen(
         [str(binary())],
@@ -101,6 +122,11 @@ def post(payload, endpoint=ENDPOINT):
             return e.code, json.loads(body)
         except json.JSONDecodeError:
             return e.code, {"raw": body}
+
+
+def post_to(endpoint, payload):
+    """POSTs to a specific bridge endpoint."""
+    return post(payload, endpoint)
 
 
 def mcp_call(proc, method, params=None, _id=[0]):

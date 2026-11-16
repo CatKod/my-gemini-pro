@@ -16,10 +16,11 @@ async function loadSaved() {
   if (saved.endpoint) el("endpoint").value = saved.endpoint;
   if (saved.token) el("token").value = saved.token;
   if (saved.account) el("account").value = saved.account;
-  el("auto").checked = saved.autoSend === true;
+  // Auto-send is on unless the user explicitly turned it off.
+  el("auto").checked = saved.autoSend !== false;
   if (saved.token) {
     setStatus(
-      saved.autoSend
+      el("auto").checked
         ? "Đã bật chế độ tự động — mỗi khi bạn mở tab Gemini, cookie tự được gửi."
         : "Đã lưu token. Bấm 'Gửi cookie' để gửi ngay, hoặc bật chế độ tự động.",
       "ok"

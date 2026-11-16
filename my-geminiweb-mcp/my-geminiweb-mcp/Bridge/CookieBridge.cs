@@ -33,6 +33,7 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
     private HttpListener _listener = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly string _tokenPath = tokenPath;
+    private readonly AccountEmailResolver _emailResolver = new();
     private Task? _loop;
 
     /// <summary>The port the bridge listens on.</summary>
@@ -40,6 +41,9 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
 
     /// <summary>The shared secret the extension must present.</summary>
     public string Token { get; } = LoadOrCreateToken(tokenPath);
+
+    /// <summary>Resolves the account email behind a harvested session, for pool matching.</summary>
+    public AccountEmailResolver EmailResolver => _emailResolver;
 
     /// <summary>Whether the bridge is currently accepting requests.</summary>
     public bool Running => _listener.IsListening;
@@ -302,7 +306,7 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
                 return;
             }
 
-            var result = Ingest(payload);
+            var result = await Ingest(payload);
             await WriteJsonAsync(context, result["ok"]?.GetValue<bool>() == true ? 200 : 400, result);
         }
         catch (Exception ex)
@@ -332,7 +336,7 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
     /// already in the pool. An unknown account creates a new entry rather than being dropped:
     /// losing a working session because the label was wrong would be worse than an extra entry.
     /// </remarks>
-    private JsonObject Ingest(JsonObject payload)
+    private async Task<JsonObject> Ingest(JsonObject payload)
     {
         string psid = (string?)payload["psid"] ?? "";
         string psidts = (string?)payload["psidts"] ?? "";
@@ -346,19 +350,6 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
                 ["ok"] = false,
                 ["error"] = "missing __Secure-1PSID",
             };
-        }
-
-        if (string.IsNullOrWhiteSpace(name))
-            name = _pool.FindByPsid(psid);
-
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            // Not a known account: create one named after the email, or after a short
-            // fingerprint of the session id so the entry is at least recognisable.
-            string label = !string.IsNullOrWhiteSpace(email)
-                ? email!.Split('@')[0]
-                : "acc-" + ShortHash(psid);
-            name = label;
         }
 
         var cookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -380,7 +371,43 @@ internal sealed class CookieBridge(AccountPool pool, string tokenPath, ILogger? 
             }
         }
 
-        var account = _pool.Upsert(name!, email, cookies);
+        // How the account is identified, in order of authority:
+        //
+        //   1. The name the extension sent. The user can pin it explicitly.
+        //   2. The Google account email. This is the durable identity: Google issues a
+        //      new __Secure-1PSID whenever a session rotates, so a harvest that arrives
+        //      with a fresh session id cannot be matched by session id at all.
+        //   3. The session id itself, as a last resort before creating a new entry.
+        //
+        // The email must be resolved before the session-id lookup, otherwise a stale
+        // entry that happens to hold the same session id would swallow the harvest and
+        // the real account would never be healed.
+        string? resolvedEmail = email;
+        if (string.IsNullOrWhiteSpace(resolvedEmail))
+        {
+            resolvedEmail = await _emailResolver.ResolveAsync(cookies);
+            if (!string.IsNullOrWhiteSpace(resolvedEmail))
+                logger?.LogInformation(
+                    "Cookie bridge: resolved account email {Email} from the harvested session.", resolvedEmail);
+        }
+
+        if (string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(resolvedEmail))
+            name = _pool.FindByEmail(resolvedEmail);
+
+        if (string.IsNullOrWhiteSpace(name))
+            name = _pool.FindByPsid(psid);
+
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            // Not a known account: create one named after the email, or after a short
+            // fingerprint of the session id so the entry is at least recognisable.
+            string label = !string.IsNullOrWhiteSpace(resolvedEmail)
+                ? resolvedEmail!.Split('@')[0]
+                : "acc-" + ShortHash(psid);
+            name = label;
+        }
+
+        var account = _pool.Upsert(name!, resolvedEmail, cookies);
 
         logger?.LogInformation(
             "Cookie bridge: stored account {Account} ({CookieCount} cookies).",

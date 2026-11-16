@@ -202,6 +202,25 @@ internal sealed class AccountPool
                 account = new AccountConfig { Name = name };
                 _accounts.Add(account);
             }
+            else if (!string.IsNullOrWhiteSpace(email))
+            {
+                // A duplicate entry for the same Google account is a leftover from a
+                // harvest that could not be matched (an older session id, or a missing
+                // email). Merging keeps one entry per account, which is what the pool
+                // rotation assumes.
+                var duplicate = _accounts.FirstOrDefault(a =>
+                    !ReferenceEquals(a, account)
+                    && !string.IsNullOrWhiteSpace(email)
+                    && string.Equals(a.Email, email, StringComparison.OrdinalIgnoreCase));
+
+                if (duplicate is not null)
+                {
+                    foreach (var (key, value) in duplicate.ExtraCookies)
+                        account.ExtraCookies.TryAdd(key, value);
+
+                    _accounts.Remove(duplicate);
+                }
+            }
 
             if (!string.IsNullOrWhiteSpace(email))
                 account.Email = email;
@@ -244,6 +263,28 @@ internal sealed class AccountPool
         {
             var match = _accounts.FirstOrDefault(
                 a => string.Equals(a.Psid, psid, StringComparison.Ordinal));
+            return match?.Name;
+        }
+    }
+
+    /// <summary>
+    /// Finds the pool account that belongs to a Google account email.
+    /// </summary>
+    /// <remarks>
+    /// The email is the only identity that survives a session rotation: Google issues a new
+    /// <c>__Secure-1PSID</c> when a session is refreshed, so a harvest that arrives with a
+    /// fresh session id cannot be matched against the pool by session id alone.
+    /// </remarks>
+    /// <returns>The matching account name, or <c>null</c>.</returns>
+    public string? FindByEmail(string email)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+            return null;
+
+        lock (_gate)
+        {
+            var match = _accounts.FirstOrDefault(
+                a => string.Equals(a.Email, email, StringComparison.OrdinalIgnoreCase));
             return match?.Name;
         }
     }

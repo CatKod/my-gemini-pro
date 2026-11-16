@@ -35,7 +35,7 @@ def main():
     log("  E2E: full cookie jar + multiple accounts")
     log("=" * 66)
 
-    proc, token, _ = start_server(home)
+    proc, token, endpoint = start_server(home)
     failures = []
 
     try:
@@ -55,7 +55,8 @@ def main():
                     "psid": jar["__Secure-1PSID"],
                     "psidts": jar.get("__Secure-1PSIDTS", ""),
                     "cookies": jar,
-                }
+                },
+                endpoint,
             )
             log(f"[1] harvest {name} -> HTTP {status} {body}")
             if status != 200:

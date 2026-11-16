@@ -43,7 +43,7 @@ def main():
         log(f"\n[OK] bridge endpoint = {endpoint}")
 
         # --- 1) a wrong token must be refused
-        status, body = post({"token": "wrong-token", "psid": "x"})
+        status, body = post({"token": "wrong-token", "psid": "x"}, endpoint)
         log(f"[1] wrong token -> HTTP {status} {body}")
         if status != 403:
             failures.append(f"a wrong token must give 403, got {status}")
@@ -58,7 +58,8 @@ def main():
                 "psid": cookies["__Secure-1PSID"],
                 "psidts": cookies.get("__Secure-1PSIDTS", ""),
                 "cookies": cookies,
-            }
+            },
+            endpoint,
         )
         log(f"[2] valid harvest -> HTTP {status} {body}")
         if status != 200 or not body.get("ok"):

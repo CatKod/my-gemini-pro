@@ -14,6 +14,9 @@ internal sealed class AppPaths
     /// <summary>Environment variable that overrides the home directory.</summary>
     public const string HomeVariable = "GEMINIWEB_MCP_HOME";
 
+    /// <summary>Environment variable that overrides the bridge's preferred port.</summary>
+    public const string BridgePortVariable = "GEMINIWEB_MCP_BRIDGE_PORT";
+
     /// <summary>The home directory holding the pool file and the download folder.</summary>
     public string Home { get; }
 
@@ -26,12 +29,26 @@ internal sealed class AppPaths
     /// <summary>The folder where generated files are written.</summary>
     public string DownloadsFolder { get; }
 
+    /// <summary>
+    /// The port the cookie bridge prefers.
+    /// </summary>
+    /// <remarks>
+    /// Overridable so a test run can stay out of the way of a bridge the user is
+    /// already running on the default port.
+    /// </remarks>
+    public int BridgePort { get; }
+
     private AppPaths(string home)
     {
         Home = home;
         PoolFile = Path.Combine(home, "accounts.json");
         BridgeTokenFile = Path.Combine(home, "bridge_token.txt");
         DownloadsFolder = Path.Combine(home, "downloads");
+        BridgePort = int.TryParse(
+            Environment.GetEnvironmentVariable(BridgePortVariable), out int port)
+            && port > 0
+                ? port
+                : 9478;
     }
 
     /// <summary>Resolves the paths, creating the folders when they are missing.</summary>

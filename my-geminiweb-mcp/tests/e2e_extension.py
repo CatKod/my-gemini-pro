@@ -189,8 +189,19 @@ def main():
         )
         log(f"[*] popup DOM: {probe.get('result', {}).get('value')}")
 
-        targets_now = client.call("Target.getTargets")
-        log(f"[*] targets: {[(t.get('type'), (t.get('url') or '')[:70]) for t in targets_now.get('targetInfos', [])]}")
+        # Point the extension at this run's bridge before anything else happens.
+        # The extension scans a range of ports, so without this it could latch onto a
+        # bridge that is already running on the machine — and write into the real pool.
+        evaluate("chrome.storage.local.clear().then(() => 'ok')")
+        evaluate(
+            f'chrome.storage.local.set({{endpoint: "http://127.0.0.1:{port}/harvest"}})'
+            ".then(() => 'ok')"
+        )
+        # Ask the background to refresh the endpoint and token from that bridge.
+        refreshed = evaluate(
+            'chrome.runtime.sendMessage({type:"PING"}).then(r => JSON.stringify(r))'
+        )
+        log(f"[*] PING -> {refreshed}")
 
         stored = evaluate(
             'chrome.storage.local.get(["endpoint","token"]).then(c => JSON.stringify(c))'
