@@ -1845,8 +1845,7 @@ PASS: every reply reported a model
 
 | Hạng mục | Kết quả |
 |---|---|
-| `Gemini/ModelRegistry.cs` | Discovery runtime từ RPC `otAQ7b`: model_id, model_number, capacity, alias, `IsSelectable`, `CurrentName` ✅ |
-| `Gemini/GeminiWebClient.cs` | Watchdog idle 120s **+** ngân sách token đầu 300s + fallback về default + chặn model khóa ngay ✅ |
+| `Gemini/ModelRegistry.cs` | Discovery runtime từ RPC `otAQ7b`: model_id, model_number, capacity, alias, `IsSelectable`, `CurrentName` ✅ || `Gemini/GeminiWebClient.cs` | Watchdog idle 120s **+** ngân sách token đầu 300s + fallback về default + chặn model khóa ngay ✅ |
 | `Tools/GeminiTools.cs` | Tool `gemini_models` (có `selectable`/`currentName`/`unselectable`); `gemini_chat` trả `servedModel`/`quotaNotice`/`fallbackReason` ✅ |
 | `orchestrator/mcp_sync.py` | Đồng bộ cookie orchestrator → MCP pool ✅ |
 | `orch_cli mcp-sync` | Lệnh CLI, mặc định dry-run, `--apply` để ghi ✅ |
@@ -1861,8 +1860,38 @@ PASS: every reply reported a model
 | `my-geminiweb-mcp/tests/verify_mcp_stdio.py` | Gọi MCP server thật qua stdio JSON-RPC |
 | `my-geminiweb-mcp/tests/verify_locked_model.py` | Xác minh model khóa bị từ chối nhanh (<2s) |
 | `my-geminiweb-mcp/tests/verify_served_model.py` | Xác minh `servedModel` luôn có + cờ `servedModelConfirmed` |
+| `my-geminiweb-mcp/tests/verify_packaged_tool.py` | Cài tool từ `.nupkg` cục bộ và gọi MCP thật ✅ |
 | `.work/probe_served_model.py` | Quét model, in servedModel / quotaNotice / fallbackReason |
+
+### NuGet — package đã sẵn sàng, chỉ còn API key
+
+Đã pack **cả 2 gói** (tool package trỏ tới RID package) và **cài + chạy thật** từ
+package cục bộ:
+
+```
+MyGeminiWebMcp.0.1.0-beta.nupkg            21 KB   (tool manifest + extension + README)
+MyGeminiWebMcp.win-x64.0.1.0-beta.nupkg    20 MB   (exe AOT 17 MB + pdb)
+
+$ dotnet tool install MyGeminiWebMcp --version 0.1.0-beta --add-source <dir>
+Tool 'mygeminiwebmcp' (version '0.1.0-beta') was successfully installed.
+
+$ py -3.14 tests/verify_packaged_tool.py
+initialize OK: {'name': 'my-geminiweb-mcp', 'version': '1.0.0.0'}
+tools: ['gemini_bridge', 'gemini_refresh', 'gemini_chat', 'gemini_check',
+        'gemini_accounts', 'gemini_models']
+PASS
+```
+
+Lệnh push (cần `NUGET_API_KEY` từ nuget.org → Profile → API keys):
+
+```powershell
+dotnet nuget push MyGeminiWebMcp.win-x64.0.1.0-beta.nupkg -s nuget.org -k $env:NUGET_API_KEY
+dotnet nuget push MyGeminiWebMcp.0.1.0-beta.nupkg        -s nuget.org -k $env:NUGET_API_KEY
+```
+
+> Push **RID package trước**, tool package sau — tool package khai báo dependency tới
+> RID package nên RID phải có sẵn trên nuget.org.
 
 ### Còn lại
 
-- [ ] Publish lên nuget.org (cần nuget.org API key)
+- [ ] Publish lên nuget.org (cần nuget.org API key — package đã pack + verify chạy thật)
