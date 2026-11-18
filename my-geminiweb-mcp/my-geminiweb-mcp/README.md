@@ -125,6 +125,14 @@ and `carbon` on a drained quota returned a Flash-Lite answer while reporting `3.
 When the server itself falls back, `servedModel` is `"account default"` and
 `fallbackReason` explains why.
 
+`servedModelConfirmed` says whether that name was **read from the reply payload** or is
+the model that was *requested*. Google only echoes a model id on some replies — a
+short answer on `4 Hydrogen` carried no model id at all — so without this flag the
+caller cannot tell a confirmed name from a guess. Verified 2026-11-19: `gemini-flash-lite`
+and `gemini-pro` come back with `servedModelConfirmed: true` (the id was in the payload);
+a reply without an echoed id comes back with `servedModelConfirmed: false` and the
+requested model as the best available answer.
+
 **Attachments.** Files are uploaded to `content-push.googleapis.com/upload`
 (`X-Tenant-Id: bard-storage`) and referenced from the chat payload, so Gemini reads
 their real content — verified with a `.py` file (`Circle` / `987654`).

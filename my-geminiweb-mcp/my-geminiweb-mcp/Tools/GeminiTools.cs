@@ -149,6 +149,12 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
             // otherwise it reads a Flash-Lite answer as a Hydrogen one.
             if (!string.IsNullOrEmpty(reply.ServedModel))
                 payload["servedModel"] = reply.ServedModel;
+
+            // Whether that name was read from the reply payload or is the model that was
+            // asked for. Google only echoes a model id on some replies, so without this
+            // flag the caller cannot tell a confirmed name from a guess.
+            payload["servedModelConfirmed"] = reply.ServedModelConfirmed;
+
             if (!string.IsNullOrEmpty(reply.QuotaNotice))
                 payload["quotaNotice"] = reply.QuotaNotice;
             if (!string.IsNullOrEmpty(reply.FallbackReason))

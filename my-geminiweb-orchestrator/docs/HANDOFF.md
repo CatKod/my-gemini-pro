@@ -1812,6 +1812,35 @@ request. Alias gồm cả tên lineup → `4 Carbon` và `4 Argon` cùng resolve
   **UTF-16 code units**. Đơn giản hơn: quét ngoặc cân bằng từ `[` đầu tiên.
 - Nhiều request probe liên tiếp làm cookie hết hạn → `harvest account` lại.
 
+### Phát hiện thứ 5: **`servedModel` null không phải do "thiếu cặp" — Google không echo model id ở mọi reply**
+
+Capture payload thật (`.work/probe_raw_turn.py`):
+
+- Payload **Pro** có cặp rõ ràng: `"e6fa609c3fa255c0",null,null,"3.1 Pro"`.
+- Payload **Hydrogen** trong 300s chỉ có frame thinking `{"37":[N]}` — **không có
+  candidate nào**, nên không có cặp id/label.
+
+→ Chỉ một số frame mới mang model id. `servedModel=null` hợp lệ nhưng vô dụng cho
+caller.
+
+**Đã sửa**
+
+- `ExtractServedModel` đi sâu qua **object** (trước chỉ qua array) + giải mã chuỗi JSON
+  lồng + giới hạn độ sâu 12.
+- `GeminiReply.ServedModelConfirmed`: `true` = đọc từ payload, `false` = suy ra.
+- `servedModel` **luôn khác null**: payload → `"account default"` (khi server fallback)
+  → model đã yêu cầu.
+- `gemini_chat` xuất thêm `servedModelConfirmed`.
+
+**Verify** (`tests/verify_served_model.py`, MCP stdio thật):
+
+```
+gemini-flash-lite → served='3.5 Flash-Lite' confirmed=True  (8.2s)
+gemini-pro        → served='3.1 Pro'       confirmed=True  (10.7s)
+4 Hydrogen        → served='account default' confirmed=False (305.9s, hết ngân sách 300s)
+PASS: every reply reported a model
+```
+
 ### Đã làm
 
 | Hạng mục | Kết quả |
@@ -1831,6 +1860,7 @@ request. Alias gồm cả tên lineup → `4 Carbon` và `4 Argon` cùng resolve
 | `my-geminiweb-mcp/tests/e2e_model_discovery.py` | Discovery 4 model + chat + servedModel |
 | `my-geminiweb-mcp/tests/verify_mcp_stdio.py` | Gọi MCP server thật qua stdio JSON-RPC |
 | `my-geminiweb-mcp/tests/verify_locked_model.py` | Xác minh model khóa bị từ chối nhanh (<2s) |
+| `my-geminiweb-mcp/tests/verify_served_model.py` | Xác minh `servedModel` luôn có + cờ `servedModelConfirmed` |
 | `.work/probe_served_model.py` | Quét model, in servedModel / quotaNotice / fallbackReason |
 
 ### Còn lại

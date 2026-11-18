@@ -355,7 +355,8 @@ internal sealed class GeminiWebClient : IDisposable
             fileData = FileTransfer.BuildFileData(uploads);
         }
 
-        string? modelHeader = await ResolveModelHeaderAsync(model);
+        (string? modelHeader, GeminiModel? requestedModel) =
+            await ResolveModelHeaderAsync(model);
         int? modelNumber = GeminiModels.ModelNumberOf(modelHeader);
         bool fellBackToDefault = false;
         string? fallbackReason = null;
@@ -384,11 +385,24 @@ internal sealed class GeminiWebClient : IDisposable
 
                 // When the answer came from the fallback, Google does not echo a model
                 // id, so the served model is the account default.
+                //
+                // When Google does not echo a model id either — which happens on short
+                // replies and on the account default — the model that was asked for is
+                // the best guess available. It is reported as unconfirmed so the caller
+                // can tell a read-from-payload value from a guess.
+                string? served = reply.ServedModel;
+                bool confirmed = reply.ServedModelConfirmed || reply.ServedModel is not null;
+
+                if (served is null && fallbackReason is not null)
+                    served = "account default";
+                else if (served is null && requestedModel is not null)
+                    served = requestedModel.Description;
+
                 return reply with
                 {
                     FallbackReason = fallbackReason,
-                    ServedModel = reply.ServedModel
-                        ?? (fallbackReason is null ? null : "account default"),
+                    ServedModel = served,
+                    ServedModelConfirmed = confirmed,
                 };
             }
             catch (GeminiTransientException ex)
@@ -438,15 +452,18 @@ internal sealed class GeminiWebClient : IDisposable
     /// reachable and a removed one simply no longer resolves.
     /// </remarks>
     /// <param name="model">The requested model name, or null for the account default.</param>
-    /// <returns>The raw header, or <c>null</c> to let Google choose the default model.</returns>
-    private async Task<string?> ResolveModelHeaderAsync(string? model)
+    /// <returns>
+    /// The raw header and the model it was built from. The header is <c>null</c> to let
+    /// Google choose the default model; the model is then <c>null</c> too.
+    /// </returns>
+    private async Task<(string? Header, GeminiModel? Model)> ResolveModelHeaderAsync(string? model)
     {
         if (string.IsNullOrWhiteSpace(model))
-            return null;
+            return (null, null);
 
         // A raw JSPB array is passed through untouched.
         if (model.TrimStart().StartsWith('['))
-            return model;
+            return (model, null);
 
         if (!Models.HasModels)
             await InitializeAsync(ct: default).ConfigureAwait(false);
@@ -475,7 +492,7 @@ internal sealed class GeminiWebClient : IDisposable
                 $"Selectable models: {Models.AvailableNames}.");
         }
 
-        return GeminiModels.BuildHeader(resolved);
+        return (GeminiModels.BuildHeader(resolved), resolved);
     }
 
     private async Task<GeminiReply> GenerateOnceAsync(
@@ -718,7 +735,9 @@ internal sealed class GeminiWebClient : IDisposable
             }
         }
 
-        return new GeminiReply(text, thoughts, cid, rid, files, servedModel, quotaNotice);
+        return new GeminiReply(
+            text, thoughts, cid, rid, files, servedModel, quotaNotice,
+            ServedModelConfirmed: servedModel is not null);
     }
 
     private static void ProcessFrame(
@@ -782,43 +801,84 @@ internal sealed class GeminiWebClient : IDisposable
 
     /// <summary>Reads the display name of the model that served the reply.</summary>
     /// <remarks>
+    /// <para>
     /// The payload carries the model id and its display name next to each other:
     /// <c>"cf41b0e0dd7d53e5", null, null, "3.5 Flash-Lite"</c>. The id is a 16-char hex
-    /// string, which is what makes the pair recognisable without hardcoding an index. The
-    /// pair does not always sit at the top level of the candidate, so the search descends.
+    /// string, which is what makes the pair recognisable without hardcoding an index.
+    /// </para>
+    /// <para>
+    /// The pair does not always sit at the top level of the candidate, so the search
+    /// descends — through arrays, through objects, and through strings that themselves
+    /// hold JSON. The last one matters: the frame envelope carries the payload as a JSON
+    /// string, and a turn that is echoed deeper still keeps wrapping it.
+    /// </para>
     /// </remarks>
-    private static string? ExtractServedModel(JsonNode? node)
+    private static string? ExtractServedModel(JsonNode? node, int depth = 0)
     {
-        if (node is not JsonArray array)
+        // The payload nests deeply; a bound keeps a malformed reply from recursing forever.
+        if (depth > 12 || node is null)
             return null;
 
-        // Shallow pass first: the id and its label are siblings.
-        for (int i = 0; i < array.Count; i++)
+        if (node is JsonArray array)
         {
-            if (array[i] is not JsonValue value
-                || !value.TryGetValue<string>(out string? s)
-                || !IsModelId(s))
+            // Shallow pass first: the id and its label are siblings.
+            for (int i = 0; i < array.Count; i++)
             {
-                continue;
-            }
-
-            for (int j = i + 1; j < Math.Min(i + 6, array.Count); j++)
-            {
-                if (array[j] is JsonValue name
-                    && name.TryGetValue<string>(out string? label)
-                    && label.Length > 0)
+                if (array[i] is not JsonValue value
+                    || !value.TryGetValue<string>(out string? s)
+                    || !IsModelId(s))
                 {
-                    return label;
+                    continue;
+                }
+
+                for (int j = i + 1; j < Math.Min(i + 6, array.Count); j++)
+                {
+                    if (array[j] is JsonValue name
+                        && name.TryGetValue<string>(out string? label)
+                        && label.Length > 0)
+                    {
+                        return label;
+                    }
                 }
             }
+
+            // Then descend: the pair can be nested several levels down.
+            foreach (var child in array)
+            {
+                var nested = ExtractServedModel(child, depth + 1);
+                if (nested is not null)
+                    return nested;
+            }
+
+            return null;
         }
 
-        // Then descend: the pair can be nested one or two levels down.
-        foreach (var child in array)
+        if (node is JsonObject obj)
         {
-            var nested = ExtractServedModel(child);
-            if (nested is not null)
-                return nested;
+            foreach (var (_, child) in obj)
+            {
+                var nested = ExtractServedModel(child, depth + 1);
+                if (nested is not null)
+                    return nested;
+            }
+
+            return null;
+        }
+
+        // A JSON string may itself hold a JSON payload.
+        if (node is JsonValue str
+            && str.TryGetValue<string>(out string? raw)
+            && raw.Length > 1
+            && raw[0] == '[')
+        {
+            try
+            {
+                return ExtractServedModel(JsonNode.Parse(raw), depth + 1);
+            }
+            catch (JsonException)
+            {
+                // Not JSON after all — fall through.
+            }
         }
 
         return null;
@@ -934,6 +994,16 @@ internal sealed class GeminiWebClient : IDisposable
 /// <param name="ReplyId">The <c>rid</c> reply handle.</param>
 /// <param name="Files">Files Gemini generated during this turn, already saved to disk.</param>
 /// <param name="Metadata">The <c>[cid, rid, rcid]</c> triple to pass back to continue the chat.</param>
+/// <param name="ServedModel">
+/// The model that answered. Echoed by Google when the reply carries a model id;
+/// otherwise it is the model that was asked for, which is only a best guess.
+/// </param>
+/// <param name="QuotaNotice">Google's note about a quota-driven downgrade, when present.</param>
+/// <param name="FallbackReason">Why the server fell back to the account default, when it did.</param>
+/// <param name="ServedModelConfirmed">
+/// Whether <see cref="ServedModel"/> was read from the reply payload. False means the
+/// model was not echoed by Google and the value is the model that was requested.
+/// </param>
 internal sealed record GeminiReply(
     string Text,
     string Thoughts,
@@ -942,7 +1012,8 @@ internal sealed record GeminiReply(
     IReadOnlyList<GeneratedFile>? Files = null,
     string? ServedModel = null,
     string? QuotaNotice = null,
-    string? FallbackReason = null)
+    string? FallbackReason = null,
+    bool ServedModelConfirmed = false)
 {
     /// <summary>The metadata triple for the next turn.</summary>
     public string[] Metadata => [ConversationId, ReplyId, ""];
