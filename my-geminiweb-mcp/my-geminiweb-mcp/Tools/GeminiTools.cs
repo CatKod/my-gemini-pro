@@ -26,9 +26,10 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
     /// Pass it back verbatim to keep the context.
     /// </param>
     /// <param name="model">
-    /// Optional model name: <c>flash</c>, <c>pro</c>, <c>flash-lite</c>, with optional
-    /// <c>-plus</c>/<c>-advanced</c> suffix, or <c>default</c>. Same model must be used for
-    /// the whole conversation.
+    /// Optional model name. The names are the ones this account is actually offered —
+    /// call <c>gemini_models</c> to list them. Examples: <c>hydrogen</c>, <c>pro</c>,
+    /// <c>3.5 flash-lite</c>, <c>carbon</c>. Pass <c>default</c> to let Google choose.
+    /// The same model must be used for the whole conversation.
     /// </param>
     /// <param name="attachments">Optional local file paths to upload with this turn.</param>
     /// <param name="extendedThinking">When true, requests extended thinking.</param>
@@ -38,7 +39,7 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
         [Description("The message to send to Gemini")] string prompt,
         [Description("Optional account pool key to pin this request to one account")] string? account = null,
         [Description("Conversation handle from a previous call, to continue the same chat")] string? conversation = null,
-        [Description("Optional model: flash, pro, flash-lite (optionally -plus/-advanced), or default")] string? model = null,
+        [Description("Optional model name, as listed by the gemini_models tool")] string? model = null,
         [Description("Optional local file paths to upload with this turn")] string[]? attachments = null,
         [Description("Request extended thinking")] bool extendedThinking = false)
     {
@@ -86,13 +87,32 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
             // that is about to expire does not fail the call.
             await TryRotateAsync(client, accountConfig);
 
-            var reply = await client.GenerateAsync(
-                prompt,
-                handle?.Metadata,
-                model,
-                attachments,
-                extendedThinking,
-                paths.DownloadsFolder);
+            GeminiReply reply;
+            try
+            {
+                reply = await client.GenerateAsync(
+                    prompt,
+                    handle?.Metadata,
+                    model,
+                    attachments,
+                    extendedThinking,
+                    paths.DownloadsFolder);
+            }
+            catch (ArgumentException ex)
+            {
+                // An unknown model name is a caller mistake, not a Gemini failure. It is
+                // reported as data — with the models this account does offer — because the
+                // MCP SDK replaces a thrown exception's message with a generic sentence.
+                return new JsonObject
+                {
+                    ["account"] = accountConfig.Name,
+                    ["error"] = ex.Message,
+                    ["availableModels"] = new JsonArray(
+                        client.Models.Models
+                            .Select(m => (JsonNode?)JsonValue.Create(m.DisplayName))
+                            .ToArray()),
+                }.ToJsonString();
+            }
 
             pool.MarkHealthy(accountConfig);
             PersistCookies(client, accountConfig);
@@ -123,6 +143,17 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
                 ["conversation"] = EncodeConversation(reply, accountConfig.Name),
                 ["thoughts"] = string.IsNullOrEmpty(reply.Thoughts) ? null : reply.Thoughts,
             };
+
+            // Which model actually answered. When the requested model's quota is
+            // exhausted, Google silently serves a cheaper one — the caller has to know,
+            // otherwise it reads a Flash-Lite answer as a Hydrogen one.
+            if (!string.IsNullOrEmpty(reply.ServedModel))
+                payload["servedModel"] = reply.ServedModel;
+            if (!string.IsNullOrEmpty(reply.QuotaNotice))
+                payload["quotaNotice"] = reply.QuotaNotice;
+            if (!string.IsNullOrEmpty(reply.FallbackReason))
+                payload["fallbackReason"] = reply.FallbackReason;
+
             if (filesJson is not null)
                 payload["files"] = filesJson;
             return payload.ToJsonString();
@@ -270,6 +301,93 @@ internal sealed class GeminiTools(AccountPool pool, AppPaths paths, CookieBridge
             ["count"] = statuses.Count,
             ["accounts"] = accounts,
         }.ToJsonString();
+    }
+
+    /// <summary>
+    /// Lists the models an account is actually offered, discovered from Gemini itself.
+    /// </summary>
+    /// <remarks>
+    /// The list is per account and per frontend build — Google renames, renumbers and
+    /// re-tiers models without notice, so it is queried live instead of being hardcoded.
+    /// The names listed here are exactly what <c>gemini_chat</c> accepts.
+    /// </remarks>
+    [McpServerTool(Name = "gemini_models")]
+    [Description("Lists the Gemini models the configured account is offered, with the names you can pass to gemini_chat.")]
+    public async Task<string> Models(string? account = null)
+    {
+        AccountConfig? accountConfig;
+        if (!string.IsNullOrWhiteSpace(account))
+        {
+            accountConfig = pool.Get(account)
+                ?? throw new InvalidOperationException(
+                    $"Account '{account}' is not in the pool. Available: " +
+                    string.Join(", ", pool.Status().Select(s => s.Name)) + ".");
+        }
+        else
+        {
+            accountConfig = pool.Next()
+                ?? throw new InvalidOperationException(
+                    "No usable Gemini account. Configure one with the 'gemini_accounts' tool or the " +
+                    "pool file at " + paths.PoolFile + ".");
+        }
+
+        using var client = new GeminiWebClient(
+            accountConfig.Psid,
+            accountConfig.Psidts,
+            extraCookies: accountConfig.ExtraCookies);
+
+        try
+        {
+            await client.InitializeAsync();
+
+            var models = new JsonArray();
+            foreach (var m in client.Models.Models)
+            {
+                models.Add((JsonNode?)new JsonObject
+                {
+                    ["name"] = m.ModelName,
+                    ["displayName"] = m.DisplayName,
+                    ["description"] = m.Description,
+                    ["modelId"] = m.ModelId,
+                    ["modelNumber"] = m.ModelNumber,
+                    ["capacity"] = m.Capacity,
+                    // Whether this account may pick the model at all. A model the account
+                    // is shown but cannot select makes Gemini open a stream that never
+                    // answers, so asking for it is refused up front.
+                    ["selectable"] = m.IsSelectable,
+                    // The name the current launch lineup uses, when it differs from the
+                    // name in the model list (Google renamed Carbon to Argon on
+                    // 2026-11-18 while the list still carried the old name).
+                    ["currentName"] = m.CurrentName,
+                    ["aliases"] = new JsonArray(
+                        m.Aliases.Select(a => (JsonNode?)JsonValue.Create(a)).ToArray()),
+                });
+            }
+
+            var unselectable = client.Models.UnselectableModels
+                .Select(m => (JsonNode?)JsonValue.Create(m.Description))
+                .ToArray();
+
+            return new JsonObject
+            {
+                ["account"] = accountConfig.Name,
+                ["count"] = models.Count,
+                ["models"] = models,
+                ["unselectable"] = new JsonArray(unselectable),
+            }.ToJsonString();
+        }
+        catch (GeminiAuthException ex)
+        {
+            pool.MarkAuthFailed(accountConfig);
+            throw new InvalidOperationException(
+                $"The session for account '{accountConfig.Name}' is no longer valid ({ex.Message}).");
+        }
+        catch (GeminiApiException ex)
+        {
+            pool.MarkFailed(accountConfig);
+            throw new InvalidOperationException(
+                $"Could not list the models of account '{accountConfig.Name}': {ex.Message}");
+        }
     }
 
     /// <summary>

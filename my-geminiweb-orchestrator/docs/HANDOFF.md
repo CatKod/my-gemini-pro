@@ -1738,3 +1738,101 @@ Device Bound Session Credentials.
 - [ ] Bridge tự tắt khi idle
 - [ ] Model selection (Flash / Pro / Extended Thinking)
 
+
+---
+
+## Session 2026-11-18 (buổi 8) — Model discovery + nguyên nhân gốc "stream treo"
+
+### Nguyên nhân gốc: **hai nguồn cookie tách rời**
+
+MCP server C# đọc cookie từ `%LOCALAPPDATA%\MyGeminiWebMcp\accounts.json`.
+Orchestrator Python đọc/ghi cookie từ `pools/<name>.json`. Hai file này **không
+liên kết**. Khi orchestrator thu hoạch lại cookie (harvest / auto-login), MCP vẫn
+giữ cookie cũ → mọi request trả `no access token`, dù web vẫn đăng nhập được.
+
+→ Đã thêm `orchestrator/mcp_sync.py` + lệnh `orch_cli mcp-sync [--apply]`.
+Sau khi chạy: **4/4 account OK** (trước đó 0/4).
+
+### Phát hiện thứ 2: **quota hết → Google tự hạ cấp, không báo lỗi**
+
+Probe 17 body response cho thấy khi quota model bị cạn, Google **không** trả lỗi:
+nó mở stream, trả lời bằng model rẻ hơn và ghi chú `"Limit reached. Continuing with
+Flash-Lite."` cạnh câu trả lời. Câu trả lời "treo" trước đây thực ra là câu trả lời
+của **Flash-Lite**, không phải của model được yêu cầu.
+
+→ MCP giờ trả `servedModel` (model thực sự trả lời) + `quotaNotice` (ghi chú của
+Google) trong output của `gemini_chat`. Verify: `servedModel="4 Hydrogen"` khi hỏi
+Hydrogen, `"3.1 Pro"` khi hỏi Pro, `"3.5 Flash-Lite"` khi hỏi Flash-Lite.
+
+### Phát hiện thứ 3: **model bị khóa không "idle" — nó giữ stream sống**
+
+Watchdog idle (120s) **không** bắt được model bị khóa. Với `gemini-carbon` (khóa),
+Google mở stream rồi gửi frame keep-alive đều đặn trong **901 giây** mà không có câu
+trả lời nào — stream không idle nên idle-timeout không bao giờ kích hoạt.
+
+→ Đã thêm **ngân sách token đầu tiên** (300s cho tới khi câu trả lời bắt đầu). Sau đó
+server fallback về model default và báo `fallbackReason`. Verify: carbon còn 300s
+(không phải 901s), trả `servedModel="account default"` + `fallbackReason`.
+
+### Phát hiện thứ 4: **cờ "model bị khóa" nằm ở slot 6 — và Google đã đổi tên Carbon → Argon**
+
+Payload `GET_USER_STATUS` (`otAQ7b`) có 25 slot. Slot 15 = danh sách model account được
+offer; **slot 24** = `neon_launch_pro_policy` = lineup model hiện hành.
+
+Mỗi entry model có 20 slot. **Slot 6 là danh sách id của các tier được phép dùng
+model đó.** Model mà account không thuộc tier nào → `slot 6 = null` → **model bị khóa**.
+Đã kiểm chứng trên cả 4 account: Flash-Lite/Hydrogen/Pro có tier list, Carbon có `null`.
+
+Đồng thời: **slot 15 vẫn ghi "Carbon" nhưng slot 24 ghi "Argon"** (cùng
+`model_number=8`). App HTML xác nhận `[["gemini-4-argon",…],["gemini-4-carbon",…]]`.
+→ Model thứ 4 đã đổi tên; id `95a4c0abcba24364` là id Carbon **cũ**, không dùng được —
+và đó chính là model treo 901s.
+
+→ `ModelRegistry` giờ đọc `IsSelectable` (slot 6) + `CurrentName` (slot 24, khớp theo
+`model_number`). `gemini_models` trả `selectable` / `currentName` / `unselectable`.
+`ResolveModelHeaderAsync` **từ chối model không selectable ngay lập tức**, không gửi
+request. Alias gồm cả tên lineup → `4 Carbon` và `4 Argon` cùng resolve.
+
+**Verify** (`my-geminiweb-mcp/tests/verify_locked_model.py`, MCP stdio thật):
+
+```
+[*] unselectable reported by server: ['4 Carbon']
+=== gemini_chat với '4 Carbon' ===  (1.5s) -> error   PASS: refused fast
+=== gemini_chat với '4 Argon' ===  (1.8s) -> error   PASS: refused fast
+=== gemini_chat với model chọn được === (5.2s) -> reply="7" servedModel="3.5 Flash-Lite"
+```
+
+**300s → 1.5s.**
+
+### Bẫn đã gặp
+
+- Probe Python phải có `User-Agent` giống Chrome — nếu không Gemini trả
+  `UNAUTHENTICATED`, dễ nhầm với cookie chết.
+- Framing `batchexecute`: prefix `)]}'` rồi `{length}\n{json}`, length tính theo
+  **UTF-16 code units**. Đơn giản hơn: quét ngoặc cân bằng từ `[` đầu tiên.
+- Nhiều request probe liên tiếp làm cookie hết hạn → `harvest account` lại.
+
+### Đã làm
+
+| Hạng mục | Kết quả |
+|---|---|
+| `Gemini/ModelRegistry.cs` | Discovery runtime từ RPC `otAQ7b`: model_id, model_number, capacity, alias, `IsSelectable`, `CurrentName` ✅ |
+| `Gemini/GeminiWebClient.cs` | Watchdog idle 120s **+** ngân sách token đầu 300s + fallback về default + chặn model khóa ngay ✅ |
+| `Tools/GeminiTools.cs` | Tool `gemini_models` (có `selectable`/`currentName`/`unselectable`); `gemini_chat` trả `servedModel`/`quotaNotice`/`fallbackReason` ✅ |
+| `orchestrator/mcp_sync.py` | Đồng bộ cookie orchestrator → MCP pool ✅ |
+| `orch_cli mcp-sync` | Lệnh CLI, mặc định dry-run, `--apply` để ghi ✅ |
+| `orchestrator/harvest.py` | Tự gọi `mcp_sync` sau mỗi lần thu hoạch ✅ |
+| AOT publish | 17.0 MB single-file exe ✅ |
+
+### Bằng chứng
+
+| Script | Nội dung |
+|---|---|
+| `my-geminiweb-mcp/tests/e2e_model_discovery.py` | Discovery 4 model + chat + servedModel |
+| `my-geminiweb-mcp/tests/verify_mcp_stdio.py` | Gọi MCP server thật qua stdio JSON-RPC |
+| `my-geminiweb-mcp/tests/verify_locked_model.py` | Xác minh model khóa bị từ chối nhanh (<2s) |
+| `.work/probe_served_model.py` | Quét model, in servedModel / quotaNotice / fallbackReason |
+
+### Còn lại
+
+- [ ] Publish lên nuget.org (cần nuget.org API key)

@@ -14,6 +14,7 @@ runtime, no Python, no extra dependencies on the user's machine.
 | Tool | Purpose |
 |---|---|
 | `gemini_chat` | Send a message to Gemini, get the reply. Pass the `conversation` handle back to continue the same chat. |
+| `gemini_models` | List the models this account is actually offered (discovered live from Gemini). |
 | `gemini_accounts` | List the configured accounts and their health. |
 | `gemini_check` | Verify that each account can actually reach Gemini. |
 | `gemini_refresh` | Keep the sessions alive by refreshing the expiring cookie. |
@@ -26,7 +27,7 @@ runtime, no Python, no extra dependencies on the user's machine.
   "prompt": "Explain this code",
   "account": "account1",       // optional: pin to one account (strict — fails instead of switching accounts)
   "conversation": "{...}",     // optional: handle from a previous reply
-  "model": "flash",            // optional: flash | pro | flash-lite (+ -plus/-advanced) | default
+  "model": "4 Hydrogen",       // optional: any name from gemini_models, or "default"
   "attachments": ["./a.py"],  // optional: local file paths to upload with this turn
   "extendedThinking": false    // optional: request extended thinking
 }
@@ -53,12 +54,76 @@ the conversation — a Gemini conversation id is meaningless on a different acco
 the call fails with a clear error instead of silently answering from another account.
 Omit `account` to let the pool rotate and fail over automatically.
 
-**Models.** `flash` (fast, default quota), `pro` (stronger, Advanced quota),
-`flash-lite`, each with optional `-plus`/`-advanced` suffix. The same model must be
-used for the whole conversation. Unknown values that look like a JSPB array (`[...]`)
-are passed through, so future models work without an update. When a named model is
-not offered to the account (Google discovers models per account, ids go stale),
-the server retries once with the account default instead of returning sorry.
+**Models are discovered, not hardcoded.** Google renames, renumbers and re-tiers models
+without notice — on 2026-11-16 `flash` had already been replaced by `hydrogen`, and on
+2026-11-18 `4 Carbon` was renamed to `4 Argon` while the model list kept the old name.
+A hardcoded table therefore goes stale, and a stale id does not produce an error: Google
+opens the stream and then never answers it.
+
+The server therefore asks Gemini which models the account is offered (the `GET_USER_STATUS`
+RPC) and sends the id, capacity tier and model number that came back. Call
+`gemini_models` to see the list; `gemini_chat` accepts any of these spellings of a model:
+
+| Spelling | Example |
+|---|---|
+| canonical name | `gemini-4-hydrogen` |
+| UI label | `4 Hydrogen` |
+| description | `3.1 Pro` |
+| localised display name | `Trợ giúp hằng ngày` |
+| internal id | `56fdd199312815e2` |
+
+**A model the account may not select is refused up front.** Gemini lists such a model
+too, but with an empty tier list — the account sees it in the picker and cannot use it.
+Asking for it makes Google open a stream that never answers, so the server refuses the
+request immediately instead of waiting. `gemini_models` marks those models with
+`"selectable": false` and lists them under `unselectable`:
+
+```jsonc
+{
+  "models": [
+    { "name": "gemini-carbon", "description": "4 Carbon", "currentName": "4 Argon",
+      "selectable": false }
+  ],
+  "unselectable": ["4 Carbon"]
+}
+```
+
+`currentName` is the name the current launch lineup uses; both spellings resolve, so
+`4 Carbon` and `4 Argon` reach the same model. The same model must be used for the whole
+conversation. A name that resolves to nothing comes back as data, not as a crash:
+
+```jsonc
+{
+  "account": "account1",
+  "error": "Unknown model 'xyz'. Available for this account: …",
+  "availableModels": ["…"]
+}
+```
+
+Values that look like a JSPB array (`[...]`) are passed through unchanged.
+
+**A stalled stream is retried without a model header.** Two watchdogs guard the turn:
+
+- *idle timeout* (120 s) — the stream opened but sent nothing. That is what a stale
+  model id looks like: Google accepts the request and never answers it.
+- *first-token budget* (300 s) — the stream is alive but produces no answer. A model the
+  account may not use (a locked one) behaves like this: Google keeps the stream open and
+  sends keep-alive frames for minutes. Verified 2026-11-18: a request for the locked
+  `4 Carbon` model held the stream open for **901 s** before the idle timeout ever fired.
+  The budget cuts that to 300 s, after which the server falls back to the account default
+  and reports `fallbackReason`.
+
+Both timeouts only guard the *first* token. Once the answer starts, a long Deep Research
+turn is not cut short.
+
+**The reply says which model actually answered.** `gemini_chat` returns `servedModel`
+(e.g. `"3.5 Flash-Lite"`) so a caller never assumes it got the model it asked for. When
+the requested model's quota is exhausted, Google silently answers with a cheaper model
+and says so in a note — that note comes back as `quotaNotice`, e.g.
+`"Limit reached. Continuing with Flash-Lite."`. Verified 2026-11-18: probing `hydrogen`
+and `carbon` on a drained quota returned a Flash-Lite answer while reporting `3.5 Flash-Lite`.
+When the server itself falls back, `servedModel` is `"account default"` and
+`fallbackReason` explains why.
 
 **Attachments.** Files are uploaded to `content-push.googleapis.com/upload`
 (`X-Tenant-Id: bard-storage`) and referenced from the chat payload, so Gemini reads

@@ -236,6 +236,7 @@ def harvest_account(
         account_registry.note_ok(account)
         _backoff_record(account, ok=True)
         result["healed"] = False
+        result["mcp_sync"] = _sync_to_mcp()
         return result
 
     # Session chết → thử chữa.
@@ -260,7 +261,27 @@ def harvest_account(
     result["session_ok"] = result["heal"].get("session_ok")
     result["account_status"] = result["heal"].get("account_status")
     _backoff_record(account, ok=bool(result["heal"].get("ok")))
+
+    if result.get("session_ok"):
+        result["mcp_sync"] = _sync_to_mcp()
+
     return result
+
+
+def _sync_to_mcp() -> dict[str, Any]:
+    """Đồng bộ cookie sang pool file của MCP server C#.
+
+    MCP server đọc cookie từ `%LOCALAPPDATA%\\MyGeminiWebMcp\\accounts.json`, tách
+    rời khỏi `pools/` của orchestrator. Không đồng bộ thì MCP tiếp tục dùng cookie
+    cũ và mọi request trả "no access token" — nguyên nhân gốc của phiên "chết giả"
+    đã gặp 2026-11-18.
+    """
+    try:
+        from orchestrator import mcp_sync
+
+        return mcp_sync.sync(apply=True)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def _heal(account: str, pool: str) -> dict[str, Any]:
@@ -365,6 +386,20 @@ def harvest_all(
     except Exception:
         pass
 
+    # Đồng bộ cookie sang pool file của MCP server C#.
+    #
+    # MCP server đọc cookie từ `%LOCALAPPDATA%\MyGeminiWebMcp\accounts.json`, tách
+    # rời khỏi `pools/` của orchestrator. Nếu không đồng bộ, MCP tiếp tục dùng
+    # cookie cũ và mọi request trả "no access token" — đây chính là nguyên nhân
+    # gốc của phiên "chết giả" đã gặp 2026-11-18.
+    mcp_sync_result: dict[str, Any] | None = None
+    try:
+        from orchestrator import mcp_sync
+
+        mcp_sync_result = mcp_sync.sync(apply=True)
+    except Exception as e:
+        mcp_sync_result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
     return {
         "ok": bool(alive) or not results,
         "total": len(results),
@@ -373,6 +408,7 @@ def harvest_all(
         "needs_human": len(needs_human),
         "in_backoff": len(backoff),
         "results": results,
+        "mcp_sync": mcp_sync_result,
         "generated_at": time.time(),
     }
 

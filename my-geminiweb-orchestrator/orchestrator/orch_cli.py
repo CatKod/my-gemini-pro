@@ -342,6 +342,25 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_mcp_sync(args: argparse.Namespace) -> int:
+    """Đồng bộ cookie từ `pools/` sang pool file của MCP server C#.
+
+    Hai thành phần giữ cookie ở hai file khác nhau. Orchestrator thu hoạch lại
+    cookie nhưng MCP server vẫn giữ cookie cũ → mọi request trả "no access
+    token" dù web vẫn đăng nhập được.
+    """
+    from orchestrator import mcp_sync
+
+    try:
+        out = mcp_sync.sync(apply=args.apply)
+    except Exception as e:
+        _print({"error": f"{type(e).__name__}: {e}"})
+        return 1
+
+    _print(out)
+    return 0 if out.get("ok") else 1
+
+
 def cmd_cookie(args: argparse.Namespace) -> int:
     """Đồng bộ cookie Gemini tự động (không cần Cookie-Editor)."""
     from pathlib import Path as _Path
@@ -630,6 +649,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rotate", action="store_true", help="sinh token mới")
     p.add_argument("--keep-token", action="store_true", help="giữ token cũ")
     p.set_defaults(func=cmd_bridge)
+
+    p = sub.add_parser(
+        "mcp-sync",
+        help="Đồng bộ cookie từ pools/ sang pool file của MCP server C#",
+    )
+    p.add_argument(
+        "--apply",
+        action="store_true",
+        help="ghi thay đổi vào accounts.json (mặc định chỉ báo cáo)",
+    )
+    p.set_defaults(func=cmd_mcp_sync)
 
     # Lệnh nội bộ: dùng để spawn runner khi chạy từ `.exe` đã đóng gói.
     # Khi frozen, `sys.executable` chính là file .exe — không thể dùng

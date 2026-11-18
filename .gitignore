@@ -105,6 +105,9 @@ artifacts.lock.json
 **/obj/
 **/bin/
 
+# Scratch của agent: TICKET, STATE.md, script probe tạm. Không commit.
+.work/
+
 # Rider / VS Code / VS
 .vs/
 .vscode/*

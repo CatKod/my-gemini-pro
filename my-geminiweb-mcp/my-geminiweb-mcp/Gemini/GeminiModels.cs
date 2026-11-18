@@ -1,53 +1,66 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
 namespace MyGeminiWebMcp.Gemini;
 
 /// <summary>
-/// Named Gemini models and their JSPB selection headers.
+/// Builds the JSPB model-selection header for a Gemini model.
 /// </summary>
 /// <remarks>
-/// Model identity is a per-account server concept: the header carries an internal model id
-/// plus a capacity tier and a model number. Names below mirror the Python reference
-/// implementation (<c>gemini_webapi.constants.Model</c>), whose ids were captured from live
-/// traffic. An unknown value that already looks like a JSPB array (<c>[...]</c>) is passed
-/// through untouched, so a future model can be used without a code change.
+/// <para>
+/// The header shape mirrors the Python reference implementation
+/// (<c>gemini_webapi.constants.build_model_header</c>): an 18-slot array whose slot 4 holds
+/// the model id, slot 11 the capacity tier and the last slot the model number.
+/// </para>
+/// <para>
+/// The values are not constants. Google renumbers and re-tiers models without notice, so
+/// the ids and model numbers come from <see cref="ModelRegistry"/> — a registry that is
+/// populated from the account's own RPC response. A hardcoded table goes stale and makes
+/// Google open a stream that never answers.
+/// </para>
 /// </remarks>
 internal static class GeminiModels
 {
-    private const string HeaderKey = "x-goog-ext-525001261-jspb";
+    /// <summary>The header key carrying the model selection.</summary>
+    public const string HeaderKey = "x-goog-ext-525001261-jspb";
 
-    /// <summary>Resolves a model name (or raw JSPB) to the full header value, or null for default.</summary>
-    public static string? ResolveHeader(string? model)
+    /// <summary>
+    /// Builds the model-selection header for a discovered model.
+    /// </summary>
+    /// <param name="model">The model to select.</param>
+    /// <returns>The raw JSPB header value.</returns>
+    public static string BuildHeader(GeminiModel model)
     {
-        if (string.IsNullOrWhiteSpace(model)
-            || string.Equals(model, "default", StringComparison.OrdinalIgnoreCase))
-            return null;
+        // The capacity slot is a plain number, except for the rarely seen field 13, where
+        // the tier is written as a two-element "null,<capacity>" pair.
+        string capacity = model.CapacityField == 13
+            ? $"null,{model.Capacity}"
+            : model.Capacity.ToString();
 
-        string name = model.Trim();
-
-        // Already a JSPB array — pass through.
-        if (name.StartsWith('['))
-            return name;
-
-        return name.ToLowerInvariant() switch
-        {
-            "gemini-flash" or "flash" => Build("fbb127bbb056c959", "1", 1),
-            "gemini-flash-lite" or "flash-lite" or "lite" => Build("cf41b0e0dd7d53e5", "1", 6),
-            "gemini-pro" or "pro" => Build("9d8ca3786ebdfbea", "1", 3),
-            "gemini-flash-plus" or "flash-plus" => Build("56fdd199312815e2", "4", 1),
-            "gemini-flash-lite-plus" or "lite-plus" => Build("8c46e95b1a07cecc", "4", 6),
-            "gemini-pro-plus" or "pro-plus" => Build("e6fa609c3fa255c0", "4", 3),
-            "gemini-flash-advanced" or "flash-advanced" => Build("56fdd199312815e2", "2", 1),
-            "gemini-flash-lite-advanced" or "lite-advanced" => Build("8c46e95b1a07cecc", "2", 6),
-            "gemini-pro-advanced" or "pro-advanced" => Build("e6fa609c3fa255c0", "2", 3),
-            _ => name.StartsWith('[') ? name : throw new ArgumentException(
-                $"Unknown model '{model}'. Use flash, flash-lite, pro (optionally -plus/-advanced), " +
-                "'default', or a raw JSPB array.",
-                nameof(model)),
-        };
+        return $"[1,null,null,null,\"{model.ModelId}\",null,null,0,[4,5,6,8],null,null,{capacity},null,null,{model.ModelNumber}]";
     }
 
-    /// <summary>The header key carrying the model selection.</summary>
-    public static string Key => HeaderKey;
+    /// <summary>
+    /// The last segment of a JSPB model header: the model number Google also wants in
+    /// slot 79 of the request payload.
+    /// </summary>
+    /// <param name="header">The raw header value.</param>
+    /// <returns>The model number, or <c>null</c> when the header does not carry one.</returns>
+    public static int? ModelNumberOf(string? header)
+    {
+        if (string.IsNullOrEmpty(header))
+            return null;
 
-    private static string Build(string modelId, string capacityTail, int modelNumber) =>
-        $"[1,null,null,null,\"{modelId}\",null,null,0,[4,5,6,8],null,null,{capacityTail},null,null,{modelNumber}]";
+        try
+        {
+            var array = JsonNode.Parse(header)!.AsArray();
+            if (array.Count > 0 && array[^1] is JsonValue v && v.TryGetValue<int>(out int n))
+                return n;
+        }
+        catch (JsonException)
+        {
+            // A malformed header simply means "no model number".
+        }
+        return null;
+    }
 }

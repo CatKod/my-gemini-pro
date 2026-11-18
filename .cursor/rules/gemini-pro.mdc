@@ -1,135 +1,146 @@
 ---
-description: Quy tắc cho dự án my-gemini-pro — điều khiển Gemini Deep Research qua gemini_webapi. Khi user nhắn "continue", đọc my-geminiweb-orchestrator/docs/HANDOFF.md trước.
+description: "Rules for the my-gemini-pro repo — drive Gemini Deep Research via paid cookies. When user says continue, read my-geminiweb-orchestrator/docs/HANDOFF.md first."
 globs: ["**/*.py", "**/*.cs", "**/*.md", "**/*.mdc"]
 alwaysApply: true
 ---
 
-# Rule cho phiên mới trong repo my-gemini-pro
+# Rules for new sessions in my-gemini-pro
 
-**Mục tiêu dự án:** điều khiển Gemini Deep Research trên `gemini.google.com` bằng cookie của
-tài khoản Google AI Pro **đã trả phí** (qua `gemini_webapi`), không dùng AI Studio
-Interactions API (vốn tính phí pay-as-you-go riêng).
+**Project goal:** drive Gemini Deep Research on `gemini.google.com` with cookies from
+paid Google AI Pro accounts (via `gemini_webapi` / C# port), never via the AI Studio
+Interactions API (separate pay-as-you-go billing).
 
 ---
 
-## 0. Cấu trúc repo (đã đổi, 2026-11-15)
+## 0. Repo layout (changed 2026-11-15)
 
-Repo chứa **2 project độc lập**:
+Two independent projects:
 
-| Thư mục | Ngôn ngữ | Vai trò | Trạng thái |
+| Folder | Language | Role | Status |
 |---|---|---|---|
-| `my-geminiweb-mcp/` | C# / .NET | **MCP Server App** — hướng mới (SDK `ModelContextProtocol` chính thức) | 🆕 đang phát triển |
-| `my-geminiweb-orchestrator/` | Python | Orchestrator CDP/cookie + GUI + CLI + MCP (Python) | 📦 archive, vẫn chạy được |
+| `my-geminiweb-mcp/` | C# / .NET | **MCP Server App** — new direction (official `ModelContextProtocol` SDK) | 🆕 active |
+| `my-geminiweb-orchestrator/` | Python | CDP/cookie orchestrator + GUI + CLI + MCP (Python) | 📦 archived, still runs |
 
-**Mọi đường dẫn trong tài liệu này đều tương đối với `my-geminiweb-orchestrator/`**
-(trừ khi ghi rõ `my-geminiweb-mcp/`).
-
----
-
-## 1. Đọc file bàn giao TRƯỚC khi làm bất cứ việc gì
-
-```
-my-geminiweb-orchestrator/docs/HANDOFF.md      ← bắt buộc đọc đầu tiên, chứa toàn bộ context
-my-geminiweb-orchestrator/docs/FINDINGS.md     ← bằng chứng + primary source cho mọi claim
-my-geminiweb-orchestrator/docs/ARCHITECTURE.md ← thiết kế hệ thống
-my-geminiweb-orchestrator/docs/COOKIE-SETUP.md ← cách lấy cookie
-my-geminiweb-orchestrator/docs/COOKIE-BRIDGE.md ← cookie bridge + auto_login + file attach/download
-```
-
-Khi user nhắn `continue`, đọc `my-geminiweb-orchestrator/docs/HANDOFF.md` trước, chạy
-`python my-geminiweb-orchestrator/scripts/continue.py`, rồi báo lại trạng thái hiện tại
-và hỏi bước tiếp theo nếu còn blocker.
+**All paths below are relative to `my-geminiweb-orchestrator/`**
+unless `my-geminiweb-mcp/` is stated.
 
 ---
 
-## 2. Nguyên tắc bất di bất dịch
+## 1. Read the handoff BEFORE doing anything
 
-1. **KHÔNG dùng AI Studio Interactions API.** Nó tính phí riêng, không trừ vào gói AI Pro.
-   Đã verify: OAuth Antigravity → HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`.
-2. **KHÔNG dùng `int04/ChatCmd`** cho Gemini — repo đó không có một dòng code Gemini nào.
-3. **KHÔNG đọc cookie Chrome/Edge từ ngoài tiến trình** — Chrome ≥127 dùng app-bound
-   encryption (prefix `v20`), đã thử và thất bại mọi cách.
-4. **KHÔNG copy cookie từ profile đang mở** — rủi ro "Evil Clone" → Google logout toàn diện.
-5. **KHÔNG commit cookie, mật khẩu, token lên git.** `.gitignore` chặn `**/pools/`,
+```
+my-geminiweb-orchestrator/docs/HANDOFF.md      <- mandatory first, holds full context
+my-geminiweb-orchestrator/docs/FINDINGS.md     <- evidence + primary source for every claim
+my-geminiweb-orchestrator/docs/ARCHITECTURE.md <- system design
+my-geminiweb-orchestrator/docs/COOKIE-SETUP.md <- how to obtain cookies
+my-geminiweb-orchestrator/docs/COOKIE-BRIDGE.md <- cookie bridge + auto_login + file attach/download
+```
+
+When the user says `continue`, read `my-geminiweb-orchestrator/docs/HANDOFF.md` first, run
+`python my-geminiweb-orchestrator/scripts/continue.py`, then report current state
+and ask for the next step if a blocker remains.
+
+---
+
+## 2. Non-negotiables
+
+1. **NEVER use the AI Studio Interactions API.** Separate billing, not covered by AI Pro.
+   Verified: OAuth Antigravity → HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`.
+2. **NEVER use `int04/ChatCmd`** for Gemini — that repo has zero Gemini code.
+3. **NEVER read Chrome/Edge cookies out-of-process** — Chrome ≥127 uses app-bound
+   encryption (prefix `v20`); every attempt failed.
+4. **NEVER copy cookies from a live profile** — "Evil Clone" risk → total Google logout.
+5. **NEVER commit cookies, passwords, tokens to git.** `.gitignore` blocks `**/pools/`,
    `**/reports/`, `**/accounts.json`, `**/cookie_files/`.
-6. **KHÔNG claim gì chưa verify.** Mọi claim load-bearing phải có primary source hoặc
-   output thật từ tool.
+6. **NEVER claim anything unverified.** Every load-bearing claim needs a primary source or
+   real tool output.
 
 ---
 
 ## 3. Stack
 
-| Thành phần | Giá trị |
+| Component | Value |
 |---|---|
-| Thư viện (Python) | `gemini-webapi` (PyPI), cài sẵn vào Python 3.14.8 |
+| Library (Python) | `gemini-webapi` (PyPI), installed into Python 3.14.8 |
 | Python | 3.14.8 (`C:\Users\kimvi\AppData\Local\Python\pythoncore-3.14-64`) |
-| Repo gốc của thư viện | <https://github.com/HanaokaYuzu/Gemini-API> — 3.8k stars, cập nhật 2026-11-10 |
-| MCP SDK (.NET, hướng mới) | [`ModelContextProtocol` C# SDK](https://csharp.sdk.modelcontextprotocol.io/) |
-| MCP server sẵn có (tham khảo) | <https://github.com/vadim-a-yegorov/mcp-gemini-deep-research> |
-| `gemini_mcp.py` (hiện có) | `C:\Users\kimvi\.cursor\bin\gemini_mcp.py` — 1178 dòng, 2 pool Antigravity |
+| Upstream repo | <https://github.com/HanaokaYuzu/Gemini-API> — 3.8k stars, updated 2026-11-10 |
+| MCP SDK (.NET, new direction) | [`ModelContextProtocol` C# SDK](https://csharp.sdk.modelcontextprotocol.io/) |
+| Reference MCP server | <https://github.com/vadim-a-yegorov/mcp-gemini-deep-research> |
+| `gemini_mcp.py` (Antigravity bridge) | `C:\Users\kimvi\.cursor\bin\gemini_mcp.py` — Antigravity-only (DR tools removed 2026-11-16) |
 
 ---
 
-## 4. Ba luồng hệ thống — đừng lẫn
+## 4. Three system lanes — do not mix them
 
-| Luồng | Công cụ | Quota |
+| Lane | Tooling | Quota |
 |---|---|---|
-| Antigravity CLI (code task) | `agy.exe` Windows + `agy` WSL2 | 2 pool Antigravity (~30% / ~96.5%) |
-| **Deep Research** | `gemini_webapi` + cookie | **Allowance Gemini Advanced (gói đã trả)** |
-| AI Studio API | Interactions API | ~~Tiền riêng~~ ❌ |
+| Antigravity CLI (batch work) | `agy.exe` Windows + `agy` WSL2 via MCP `gemini-antigravity` | 2 Antigravity pools |
+| **Gemini Web** | C# `gemini-web` MCP + cookies + extension v1.4.0 | **Gemini Advanced allowance (paid plan)** |
+| AI Studio API | Interactions API | ~~separate money~~ ❌ |
 
 ---
 
 ## 5. Pool mapping
 
-| Pool | Cookie file | Tài khoản |
+| Pool | Cookie file | Account |
 |---|---|---|
 | `windows` | `pools/windows.json` | `mmeo44244@gmail.com` |
 | `wsl` | `pools/wsl.json` | `catkingmv@gmail.com` |
 
-Tên pool khớp với pool Antigravity để `auto` routing nhất quán.
-Thư mục `pools/` nằm trong `my-geminiweb-orchestrator/pools/`.
+Pool names match Antigravity pools so `auto` routing stays consistent.
+`pools/` lives in `my-geminiweb-orchestrator/pools/`.
 
 ---
 
-## 6. Workflow chuẩn
+## 6. Standard workflow
 
 ```powershell
 cd my-geminiweb-orchestrator
 
-# Kiểm tra trạng thái cookie hiện tại
+# Current cookie state
 python scripts\scan_browser_cookies.py
 
-# Kiểm tra pool đã cấu hình
+# Validate configured pools
 python scripts\setup_pool.py validate
 
-# Test thật 1 câu
+# One real probe sentence
 python scripts\setup_pool.py probe
 
-# Thu hoạch cookie live + tự đăng nhập lại nếu session chết
+# Live harvest + auto re-login when a session dies
 python -m orchestrator.orch_cli harvest all
+```
+
+Web-lane health from any repo (no harvest needed):
+
+```
+gemini_check      # via MCP gemini-web
+gemini_bridge     # endpoint + token for the extension
 ```
 
 ---
 
-## 7. Khi cần verify một claim về `gemini_webapi`
+## 7. Verifying a `gemini_webapi` claim
 
-Đọc source thật, **không** đoán:
+Read the real source, **never** guess:
 
 ```powershell
 $src = "$env:TEMP\gemini-webapi\src\gemini_webapi"
-# nếu chưa clone:
+# if not cloned yet:
 git clone --depth 1 https://github.com/HanaokaYuzu/Gemini-API.git "$env:TEMP\gemini-webapi"
 
 rg -n "deep_research|_assert_deep_research_capable|inspect_account_status" $src
 rg -n "GRPC\.|DEEP_RESEARCH" "$src\constants.py"
 ```
 
+For the C# port the source of truth is
+`my-geminiweb-mcp/my-geminiweb-mcp/Gemini/` (`GeminiWebClient.cs`, `FileTransfer.cs`).
+
 ---
 
-## 8. Báo cáo
+## 8. Reporting
 
-- Báo cáo bằng **tiếng Việt**.
-- Nêu rõ: đã làm gì, verify bằng cách nào, còn blocker gì.
-- Nếu có dùng quota Gemini (Antigravity) → báo dòng quota.
-- Không hứa kết quả Deep Research nếu chưa chạy thật.
+- Report in **Vietnamese**.
+- State: what was done, how it was verified, what still blocks.
+- Antigravity quota used → include the quota line.
+- Web allowance used → include account + `gemini_check` before/after.
+- Never promise Deep Research output before a real run.

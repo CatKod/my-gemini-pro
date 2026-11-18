@@ -28,8 +28,37 @@ internal sealed class GeminiWebClient : IDisposable
     private const string InitUrl = "https://gemini.google.com/app";
     private const string GenerateUrl =
         "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
+    private const string BatchExecuteUrl = "https://gemini.google.com/_/BardChatUi/data/batchexecute";
     private const string ModelHeaderKey = "x-goog-ext-525001261-jspb";
     private const string RequestIdHeaderKey = "x-goog-ext-525005358-jspb";
+
+    /// <summary>The RPC that returns the account's model list.</summary>
+    private const string GetUserStatusRpcId = "otAQ7b";
+
+    /// <summary>
+    /// How long a stream may stay silent before it is declared dead.
+    /// </summary>
+    /// <remarks>
+    /// A stale model id does not produce an error: Google opens the stream and then never
+    /// sends anything. The idle timeout turns that silence into a retryable failure
+    /// instead of an indefinite hang. It matches the watchdog of the Python reference
+    /// implementation, and is generous enough for a thinking model, which can stay silent
+    /// for a minute before its first token.
+    /// </remarks>
+    private static readonly TimeSpan StreamIdleTimeout = TimeSpan.FromSeconds(120);
+
+    /// <summary>
+    /// How long one whole turn may take before it is declared dead.
+    /// </summary>
+    /// <remarks>
+    /// The idle timeout cannot catch a locked model: Google keeps the stream open and
+    /// sends keep-alive frames, so the stream is never idle — it just never produces an
+    /// answer. Verified 2026-11-18: a request for the locked `4 Carbon` model kept the
+    /// stream open for 901 s. A budget on the whole turn catches that case.
+    ///
+    /// It is generous enough for a Deep Research turn, which can think for minutes.
+    /// </remarks>
+    private static readonly TimeSpan TurnTimeout = TimeSpan.FromSeconds(300);
 
     /// <summary>
     /// The 10-slot metadata template Gemini expects. Slots 0/1/2 carry
@@ -109,6 +138,11 @@ internal sealed class GeminiWebClient : IDisposable
     /// <summary>The session bootstrap values scraped from the app page.</summary>
     public GeminiSession? Session { get; private set; }
 
+    /// <summary>
+    /// The models this account is offered, discovered from Gemini itself.
+    /// </summary>
+    public ModelRegistry Models { get; } = new();
+
     /// <summary>The cookie jar, so callers can read refreshed cookie values.</summary>
     public CookieJar Cookies => _jar;
 
@@ -148,7 +182,138 @@ internal sealed class GeminiWebClient : IDisposable
             Extract(body, "FdrFJe"),
             Extract(body, "TuX5cc") is { Length: > 0 } lang ? lang : "en",
             Extract(body, "qKIAYe") is { Length: > 0 } push ? push : "feeds/mcudyrk2a4khkz");
+
+        await DiscoverModelsAsync(ct);
+
         return Session;
+    }
+
+    /// <summary>
+    /// Asks Gemini which models this account is offered.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The model list is per account and per frontend build: Google renames, renumbers and
+    /// re-tiers models without notice, so a hardcoded table goes stale. A stale id does not
+    /// produce an error — Google opens a stream that never answers — which is why the
+    /// selection must come from the account's own RPC response.
+    /// </para>
+    /// <para>
+    /// A failure here is not fatal: the chat still works without a model header, letting
+    /// Google pick the account's default model.
+    /// </para>
+    /// </remarks>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task DiscoverModelsAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var body = await BatchExecuteAsync(GetUserStatusRpcId, "[]", ct);
+            if (body is not null)
+                Models.ApplyUserStatus(body);
+        }
+        catch (Exception)
+        {
+            // Discovery is best-effort: without it, requests simply omit the model header.
+        }
+    }
+
+    /// <summary>
+    /// Runs one RPC through Google's batchexecute endpoint and returns its payload.
+    /// </summary>
+    /// <param name="rpcId">The RPC id, e.g. <c>otAQ7b</c>.</param>
+    /// <param name="payload">The RPC payload, as JSON.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The parsed payload, or <c>null</c> when the RPC did not answer.</returns>
+    private async Task<JsonArray?> BatchExecuteAsync(
+        string rpcId, string payload, CancellationToken ct)
+    {
+        var session = Session!;
+
+        var query = new List<string>
+        {
+            "rpcids=" + rpcId,
+            "hl=" + Uri.EscapeDataString(session.Language),
+            "_reqid=" + _reqId,
+            "rt=c",
+            "source-path=/app",
+        };
+        _reqId += 100_000;
+
+        if (session.BuildLabel.Length > 0)
+            query.Add("bl=" + Uri.EscapeDataString(session.BuildLabel));
+        if (session.SessionId.Length > 0)
+            query.Add("f.sid=" + Uri.EscapeDataString(session.SessionId));
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post, $"{BatchExecuteUrl}?{string.Join('&', query)}");
+        ApplyCommonHeaders(request);
+        request.Headers.TryAddWithoutValidation("X-Same-Domain", "1");
+
+        // The batchexecute model header carries the session id as its trailing value.
+        request.Headers.TryAddWithoutValidation(
+            ModelHeaderKey,
+            $"[1,null,null,null,null,null,null,null,[4,5,6,8],null,null,null,null,null,null,null,\"{_sessionId}\"]");
+        request.Headers.TryAddWithoutValidation("x-goog-ext-73010989-jspb", "[0]");
+
+        request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["at"] = session.AccessToken,
+            // f.req is the batch: a list of RPC calls, each one [id, payload, null, tag].
+            ["f.req"] = new JsonArray(
+                new JsonArray(new JsonArray(rpcId, payload, null, "generic"))).ToJsonString(),
+        });
+        request.Content.Headers.Remove("Content-Type");
+        request.Content.Headers.TryAddWithoutValidation(
+            "Content-Type", "application/x-www-form-urlencoded;charset=utf-8");
+
+        using var response = await _http.SendAsync(request, ct);
+        if (!response.IsSuccessStatusCode)
+            return null;
+
+        _jar.Absorb(response);
+        string body = await response.Content.ReadAsStringAsync(ct);
+        return ParseRpcPayload(body, rpcId);
+    }
+
+    /// <summary>
+    /// Extracts one RPC's payload from a batchexecute response.
+    /// </summary>
+    /// <remarks>
+    /// The response is a length-prefixed stream of envelopes. Each envelope carries the
+    /// RPC id in slot 1 and the payload as a JSON string in slot 2.
+    /// </remarks>
+    /// <param name="body">The raw response body.</param>
+    /// <param name="rpcId">The RPC id to look for.</param>
+    /// <returns>The parsed payload, or <c>null</c> when the RPC did not answer.</returns>
+    private static JsonArray? ParseRpcPayload(string body, string rpcId)
+    {
+        var parser = new StreamingFrameParser();
+        var decoder = new UTF8Encoding(false);
+
+        List<JsonNode?> frames = [.. parser.Feed(decoder.GetString(Encoding.UTF8.GetBytes(body)))];
+        frames.AddRange(parser.Flush());
+
+        foreach (var frame in frames)
+        {
+            if (frame is not JsonArray envelope || envelope.Count < 3)
+                continue;
+            if (envelope[1]?.GetValue<string>() != rpcId)
+                continue;
+            if (envelope[2] is not JsonValue value || !value.TryGetValue<string>(out var raw))
+                continue;
+
+            try
+            {
+                return JsonNode.Parse(raw) as JsonArray;
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -161,9 +326,9 @@ internal sealed class GeminiWebClient : IDisposable
     /// the same conversation; pass <c>null</c> to start a new one.
     /// </param>
     /// <param name="model">
-    /// Optional model name (<c>flash</c>, <c>pro</c>, <c>flash-lite</c>, with optional
-    /// <c>-plus</c>/<c>-advanced</c> suffix), <c>default</c>, or a raw JSPB array.
-    /// When omitted, Google picks the account's default model.
+    /// Optional model name. The names come from the account itself (e.g. <c>hydrogen</c>,
+    /// <c>pro</c>, <c>3.5 flash-lite</c>, <c>carbon</c>), or <c>default</c>, or a raw JSPB
+    /// array. When omitted, Google picks the account's default model.
     /// </param>
     /// <param name="attachments">Optional local file paths to upload with the turn.</param>
     /// <param name="extendedThinking">When true, requests extended thinking (slot 80 = 2).</param>
@@ -190,9 +355,10 @@ internal sealed class GeminiWebClient : IDisposable
             fileData = FileTransfer.BuildFileData(uploads);
         }
 
-        string? modelHeader = GeminiModels.ResolveHeader(model);
-        int? modelNumber = ModelNumberOf(modelHeader);
+        string? modelHeader = await ResolveModelHeaderAsync(model);
+        int? modelNumber = GeminiModels.ModelNumberOf(modelHeader);
         bool fellBackToDefault = false;
+        string? fallbackReason = null;
 
         GeminiApiException? lastError = null;
         for (int attempt = 1; attempt <= 3; attempt++)
@@ -210,12 +376,20 @@ internal sealed class GeminiWebClient : IDisposable
                 if (modelHeader is not null && !fellBackToDefault && IsGenericRefusal(reply.Text))
                 {
                     fellBackToDefault = true;
+                    fallbackReason = "Google refused the requested model with a generic error.";
                     modelHeader = null;
                     modelNumber = null;
                     continue;
                 }
 
-                return reply;
+                // When the answer came from the fallback, Google does not echo a model
+                // id, so the served model is the account default.
+                return reply with
+                {
+                    FallbackReason = fallbackReason,
+                    ServedModel = reply.ServedModel
+                        ?? (fallbackReason is null ? null : "account default"),
+                };
             }
             catch (GeminiTransientException ex)
             {
@@ -224,11 +398,24 @@ internal sealed class GeminiWebClient : IDisposable
                     break;
                 await Task.Delay(TimeSpan.FromSeconds(5 * attempt), ct);
             }
+            catch (GeminiStreamStalledException ex) when (modelHeader is not null && !fellBackToDefault)
+            {
+                // The stream opened and then went silent. That is what a model id this
+                // account is not offered looks like: Google accepts the request and never
+                // answers it. Retry once without a model header and let Google pick the
+                // account's default model.
+                fellBackToDefault = true;
+                fallbackReason = ex.Message;
+                lastError = ex;
+                modelHeader = null;
+                modelNumber = null;
+            }
             catch (GeminiApiException ex) when (IsModelMismatch(ex.Message) && modelHeader is not null && !fellBackToDefault)
             {
                 // Same stale-id situation, surfaced as 1050/1052: retry once without
                 // a model header and let Google pick the account default.
                 fellBackToDefault = true;
+                fallbackReason = ex.Message;
                 lastError = ex;
                 modelHeader = null;
                 modelNumber = null;
@@ -241,6 +428,54 @@ internal sealed class GeminiWebClient : IDisposable
         }
 
         throw lastError ?? new GeminiApiException("StreamGenerate failed after 3 attempts.");
+    }
+
+    /// <summary>
+    /// Turns a model name into the model-selection header.
+    /// </summary>
+    /// <remarks>
+    /// The names come from the account's own model list, so a renamed model is still
+    /// reachable and a removed one simply no longer resolves.
+    /// </remarks>
+    /// <param name="model">The requested model name, or null for the account default.</param>
+    /// <returns>The raw header, or <c>null</c> to let Google choose the default model.</returns>
+    private async Task<string?> ResolveModelHeaderAsync(string? model)
+    {
+        if (string.IsNullOrWhiteSpace(model))
+            return null;
+
+        // A raw JSPB array is passed through untouched.
+        if (model.TrimStart().StartsWith('['))
+            return model;
+
+        if (!Models.HasModels)
+            await InitializeAsync(ct: default).ConfigureAwait(false);
+
+        var resolved = Models.Resolve(model);
+        if (resolved is null)
+        {
+            throw new ArgumentException(
+                $"Unknown model '{model}'. Available for this account: {Models.AvailableNames}.");
+        }
+
+        // The account is shown the model but may not select it. Asking for it anyway
+        // makes Google open a stream that never answers, so the request is refused
+        // here instead of hanging until the turn budget runs out.
+        if (!resolved.IsSelectable)
+        {
+            string nowCalled = resolved.CurrentName is not null
+                && !string.IsNullOrEmpty(resolved.CurrentName)
+                && resolved.CurrentName != resolved.Description
+                    ? $" (now called '{resolved.CurrentName}')"
+                    : "";
+
+            throw new InvalidOperationException(
+                $"Model '{resolved.Description}'{nowCalled} is not available for this account. " +
+                "Google would accept the request and never answer it. " +
+                $"Selectable models: {Models.AvailableNames}.");
+        }
+
+        return GeminiModels.BuildHeader(resolved);
     }
 
     private async Task<GeminiReply> GenerateOnceAsync(
@@ -347,23 +582,6 @@ internal sealed class GeminiWebClient : IDisposable
         return await ReadReplyAsync(response, downloadsFolder, ct);
     }
 
-    /// <summary>The last segment of a JSPB model header: the model number Google also wants in slot 79.</summary>
-    private static int? ModelNumberOf(string? header)
-    {
-        if (string.IsNullOrEmpty(header))
-            return null;
-        try
-        {
-            var array = JsonNode.Parse(header)!.AsArray();
-            if (array.Count > 0 && array[^1] is JsonValue v && v.TryGetValue<int>(out int n))
-                return n;
-        }
-        catch (JsonException)
-        {
-        }
-        return null;
-    }
-
     /// <summary>Whether a failure message looks transient and worth one more attempt.</summary>
     private static bool IsTransientMessage(string message) =>
         message.Contains("1013")
@@ -397,25 +615,90 @@ internal sealed class GeminiWebClient : IDisposable
         string thoughts = "";
         string cid = "";
         string rid = "";
+        string? servedModel = null;
+        string? quotaNotice = null;
         int? apiError = null;
         var rawCandidates = new List<JsonArray>();
 
         await using (var stream = await response.Content.ReadAsStreamAsync(ct))
         {
-            int read;
-            while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+            bool gotAnswer = false;
+            using var overall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+            // A model the account may not use (a locked one) is answered differently from
+            // a stale id: Google keeps the stream open and sends keep-alive frames for
+            // minutes without ever producing an answer. An idle timeout never fires
+            // there, because the stream is not idle — it is just silent about the
+            // answer. A budget on the whole turn catches that case.
+            overall.CancelAfter(TurnTimeout);
+
+            try
             {
-                foreach (var frame in parser.Feed(decoder.GetString(buffer, 0, read)))
+                while (true)
                 {
-                    ProcessFrame(frame, ref text, ref thoughts, ref cid, ref rid, ref apiError, rawCandidates);
+                    // A stale model id does not fail: Google opens the stream and then goes
+                    // silent forever. The idle timeout turns that silence into a retryable
+                    // failure instead of an indefinite hang.
+                    //
+                    // The timeout is applied to the read itself, not as a wrapper around it:
+                    // a wrapper leaves the underlying read pending, and disposing the response
+                    // then blocks on that pending read — which would hang the whole call
+                    // instead of failing it.
+                    int read;
+                    using (var idle = CancellationTokenSource.CreateLinkedTokenSource(overall.Token))
+                    {
+                        idle.CancelAfter(StreamIdleTimeout);
+                        try
+                        {
+                            read = await stream.ReadAsync(buffer, idle.Token);
+                        }
+                        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                        {
+                            if (overall.IsCancellationRequested)
+                            {
+                                throw new GeminiStreamStalledException(
+                                    $"Gemini kept the stream open for {TurnTimeout.TotalSeconds:F0}s without "
+                                    + "answering. The requested model is probably not offered to this account.");
+                            }
+
+                            throw new GeminiStreamStalledException(
+                                $"Gemini opened the stream but sent nothing for {StreamIdleTimeout.TotalSeconds:F0}s. " +
+                                "The requested model is probably not offered to this account.");
+                        }
+                    }
+
+                    if (read <= 0)
+                        break;
+
+                    foreach (var frame in parser.Feed(decoder.GetString(buffer, 0, read)))
+                    {
+                        ProcessFrame(frame, ref text, ref thoughts, ref cid, ref rid,
+                            ref apiError, rawCandidates, ref servedModel, ref quotaNotice);
+                    }
+
+                    if (!gotAnswer && (text.Length > 0 || thoughts.Length > 0))
+                    {
+                        // The answer has started. The first-token budget has done its job;
+                        // from here on the idle timeout is enough, so a long Deep Research
+                        // turn is not cut short.
+                        gotAnswer = true;
+                        overall.CancelAfter(Timeout.InfiniteTimeSpan);
+                    }
                 }
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                throw new GeminiStreamStalledException(
+                    $"Gemini kept the stream open for {TurnTimeout.TotalSeconds:F0}s without "
+                    + "answering. The requested model is probably not offered to this account.");
             }
         }
 
         foreach (var frame in parser.Flush())
         {
             // Frames arriving after the stream closed still carry the final reply.
-            ProcessFrame(frame, ref text, ref thoughts, ref cid, ref rid, ref apiError, rawCandidates);
+            ProcessFrame(frame, ref text, ref thoughts, ref cid, ref rid,
+                ref apiError, rawCandidates, ref servedModel, ref quotaNotice);
         }
 
         if (apiError is not null)
@@ -435,13 +718,14 @@ internal sealed class GeminiWebClient : IDisposable
             }
         }
 
-        return new GeminiReply(text, thoughts, cid, rid, files);
+        return new GeminiReply(text, thoughts, cid, rid, files, servedModel, quotaNotice);
     }
 
     private static void ProcessFrame(
         JsonNode? frame,
         ref string text, ref string thoughts, ref string cid, ref string rid,
-        ref int? apiError, List<JsonArray> rawCandidates)
+        ref int? apiError, List<JsonArray> rawCandidates,
+        ref string? servedModel, ref string? quotaNotice)
     {
         if (frame is not JsonArray envelope || envelope.Count < 3)
             return;
@@ -465,6 +749,13 @@ internal sealed class GeminiWebClient : IDisposable
         if (code is not null)
             apiError = code;
 
+        // The reply carries the model that actually served it. When the quota of the
+        // requested model is exhausted, Google silently serves Flash-Lite instead and
+        // says so in a note next to the answer. Without reading that, a caller would
+        // believe it got the model it asked for.
+        servedModel = ExtractServedModel(p) ?? servedModel;
+        quotaNotice = ExtractQuotaNotice(p) ?? quotaNotice;
+
         if (p[1] is JsonArray meta && meta.Count >= 2)
         {
             cid = meta[0]?.GetValue<string>() ?? cid;
@@ -487,6 +778,82 @@ internal sealed class GeminiWebClient : IDisposable
             }
             thoughts = ExtractThoughts(c) ?? thoughts;
         }
+    }
+
+    /// <summary>Reads the display name of the model that served the reply.</summary>
+    /// <remarks>
+    /// The payload carries the model id and its display name next to each other:
+    /// <c>"cf41b0e0dd7d53e5", null, null, "3.5 Flash-Lite"</c>. The id is a 16-char hex
+    /// string, which is what makes the pair recognisable without hardcoding an index. The
+    /// pair does not always sit at the top level of the candidate, so the search descends.
+    /// </remarks>
+    private static string? ExtractServedModel(JsonNode? node)
+    {
+        if (node is not JsonArray array)
+            return null;
+
+        // Shallow pass first: the id and its label are siblings.
+        for (int i = 0; i < array.Count; i++)
+        {
+            if (array[i] is not JsonValue value
+                || !value.TryGetValue<string>(out string? s)
+                || !IsModelId(s))
+            {
+                continue;
+            }
+
+            for (int j = i + 1; j < Math.Min(i + 6, array.Count); j++)
+            {
+                if (array[j] is JsonValue name
+                    && name.TryGetValue<string>(out string? label)
+                    && label.Length > 0)
+                {
+                    return label;
+                }
+            }
+        }
+
+        // Then descend: the pair can be nested one or two levels down.
+        foreach (var child in array)
+        {
+            var nested = ExtractServedModel(child);
+            if (nested is not null)
+                return nested;
+        }
+
+        return null;
+    }
+
+    /// <summary>Whether a string looks like Gemini's internal model id.</summary>
+    private static bool IsModelId(string? value) =>
+        value is { Length: 16 } && value.All(Uri.IsHexDigit);
+
+    /// <summary>Reads Google's note about a quota-driven downgrade, when there is one.</summary>
+    /// <remarks>
+    /// The note looks like <c>"Limit reached. Continuing with Flash-Lite."</c>. When it is
+    /// there, the reply did NOT come from the model that was asked for: the quota of that
+    /// model was exhausted and Google served a cheaper one instead.
+    /// </remarks>
+    private static string? ExtractQuotaNotice(JsonNode? node)
+    {
+        if (node is JsonValue value
+            && value.TryGetValue<string>(out string? s)
+            && s.Contains("Limit reached", StringComparison.OrdinalIgnoreCase))
+        {
+            return s;
+        }
+
+        if (node is JsonArray array)
+        {
+            foreach (var child in array)
+            {
+                var nested = ExtractQuotaNotice(child);
+                if (nested is not null)
+                    return nested;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>Reads a nested int at a path like [5,2,0,1,0]; null when absent.</summary>
@@ -572,7 +939,10 @@ internal sealed record GeminiReply(
     string Thoughts,
     string ConversationId,
     string ReplyId,
-    IReadOnlyList<GeneratedFile>? Files = null)
+    IReadOnlyList<GeneratedFile>? Files = null,
+    string? ServedModel = null,
+    string? QuotaNotice = null,
+    string? FallbackReason = null)
 {
     /// <summary>The metadata triple for the next turn.</summary>
     public string[] Metadata => [ConversationId, ReplyId, ""];
@@ -586,4 +956,15 @@ internal class GeminiApiException(string message) : Exception(message);
 
 /// <summary>Raised for transient Google errors (1013, ...) that deserve one more attempt.</summary>
 internal sealed class GeminiTransientException(string message) : GeminiApiException(message);
+
+/// <summary>
+/// Raised when Google opens a stream and then never answers.
+/// </summary>
+/// <remarks>
+/// This is what a model the account is not offered looks like: the request is accepted,
+/// the HTTP status is 200, and no frame ever arrives. Treating it as a distinct failure
+/// lets the caller retry without the model header, so Google picks the default model
+/// instead of hanging.
+/// </remarks>
+internal sealed class GeminiStreamStalledException(string message) : GeminiApiException(message);
 
