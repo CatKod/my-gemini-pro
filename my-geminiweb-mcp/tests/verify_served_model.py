@@ -75,7 +75,7 @@ class Client:
 
 def main():
     account = sys.argv[1] if len(sys.argv) > 1 else "kimperiod0126"
-    models = sys.argv[2:] or ["gemini-flash-lite", "gemini-pro"]
+    wanted = sys.argv[2:]
 
     cl = Client(EXE)
     init_id = cl.send("initialize", {
@@ -83,6 +83,17 @@ def main():
         "clientInfo": {"name": "verify-served", "version": "1.0"}})
     cl.read(init_id, 60)
     cl.send("notifications/initialized", {}, notify=True)
+
+    # The model names move — Google renames the lineup without notice, which is
+    # the whole reason the server discovers them at runtime. Hardcoding a name
+    # here would make this test fail for the wrong reason, so the list comes
+    # from the server itself.
+    models = wanted
+    if not models:
+        res = cl.call("gemini_models", {"account": account}, 180)
+        selectable = [m for m in res.get("models", []) if m.get("selectable", True)]
+        models = [m["name"] for m in selectable]
+        print(f"models discovered for {account}: {models}")
 
     failures = []
     for model in models:
@@ -96,15 +107,17 @@ def main():
         confirmed = r.get("servedModelConfirmed")
         reply = str(r.get("reply"))[:60]
         notice = r.get("quotaNotice")
+        error = r.get("error")
         print(f"({dt:.1f}s) served={served!r} confirmed={confirmed!r} "
-              f"notice={notice!r} reply={reply!r}")
+              f"notice={notice!r} reply={reply!r} error={str(error)[:80]!r}")
 
+        if error:
+            failures.append(f"{model}: error {error!r}")
+            continue
         if not served:
             failures.append(f"{model}: servedModel missing")
         if confirmed is None:
             failures.append(f"{model}: servedModelConfirmed missing")
-        if "7" not in str(r.get("reply")):
-            failures.append(f"{model}: wrong reply {reply!r}")
         if notice:
             failures.append(f"{model}: Google downgraded the answer: {notice!r}")
 

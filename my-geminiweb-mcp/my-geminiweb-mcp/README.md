@@ -55,10 +55,11 @@ the call fails with a clear error instead of silently answering from another acc
 Omit `account` to let the pool rotate and fail over automatically.
 
 **Models are discovered, not hardcoded.** Google renames, renumbers and re-tiers models
-without notice — on 2026-11-16 `flash` had already been replaced by `hydrogen`, and on
-2026-11-18 `4 Carbon` was renamed to `4 Argon` while the model list kept the old name.
-A hardcoded table therefore goes stale, and a stale id does not produce an error: Google
-opens the stream and then never answers it.
+without notice — on 2026-11-16 `flash` had already been replaced by `hydrogen`, on
+2026-11-18 `4 Carbon` was renamed to `4 Argon` while the model list kept the old name,
+and on 2026-11-19 the whole lineup changed again (`flash-lite` → `tự-động`,
+`pro` → `neon`). A hardcoded table therefore goes stale, and a stale id does not
+produce an error: Google opens the stream and then never answers it.
 
 The server therefore asks Gemini which models the account is offered (the `GET_USER_STATUS`
 RPC) and sends the id, capacity tier and model number that came back. Call
@@ -68,7 +69,7 @@ RPC) and sends the id, capacity tier and model number that came back. Call
 |---|---|
 | canonical name | `gemini-4-hydrogen` |
 | UI label | `4 Hydrogen` |
-| description | `3.1 Pro` |
+| description | `4 Neon` |
 | localised display name | `Trợ giúp hằng ngày` |
 | internal id | `56fdd199312815e2` |
 
@@ -128,8 +129,8 @@ When the server itself falls back, `servedModel` is `"account default"` and
 `servedModelConfirmed` says whether that name was **read from the reply payload** or is
 the model that was *requested*. Google only echoes a model id on some replies — a
 short answer on `4 Hydrogen` carried no model id at all — so without this flag the
-caller cannot tell a confirmed name from a guess. Verified 2026-11-19: `gemini-flash-lite`
-and `gemini-pro` come back with `servedModelConfirmed: true` (the id was in the payload);
+caller cannot tell a confirmed name from a guess. Verified 2026-11-19:
+`gemini-neon` comes back with `servedModelConfirmed: true` (the id was in the payload);
 a reply without an echoed id comes back with `servedModelConfirmed: false` and the
 requested model as the best available answer.
 

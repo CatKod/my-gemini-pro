@@ -1832,14 +1832,35 @@ caller.
   → model đã yêu cầu.
 - `gemini_chat` xuất thêm `servedModelConfirmed`.
 
-**Verify** (`tests/verify_served_model.py`, MCP stdio thật):
+**Verify** (`tests/verify_served_model.py`, MCP stdio thật, tự discover danh sách model
+nên không fail vì lý do sai khi Google đổi tên):
 
 ```
-gemini-flash-lite → served='3.5 Flash-Lite' confirmed=True  (8.2s)
-gemini-pro        → served='3.1 Pro'       confirmed=True  (10.7s)
-4 Hydrogen        → served='account default' confirmed=False (305.9s, hết ngân sách 300s)
+models discovered: ['gemini-tự-động', 'gemini-4-hydrogen', 'gemini-neon']
+gemini-tự-động  → served='account default' confirmed=False (154.4s)
+gemini-4-hydrogen → served='4 Hydrogen'   confirmed=True  (59.7s)
+gemini-neon       → served='4 Neon'       confirmed=True  (18.7s)
 PASS: every reply reported a model
 ```
+
+### Phát hiện thứ 6: **Google đổi cả lineup lúc 2026-11-19 07:00**
+
+`gemini_models` trả về 4 model với tên hoàn toàn mới:
+
+| canonical name | description | selectable |
+|---|---|---|
+| `gemini-tự-động` | Thích ứng với nhu cầu của bạn | ✅ |
+| `gemini-4-hydrogen` | `4 Hydrogen` | ✅ |
+| `gemini-neon` | `4 Neon` | ✅ |
+| `gemini-carbon` | `4 Carbon` | ❌ (slot 6 = null) |
+
+`gemini-flash-lite` và `gemini-pro` **không còn tồn tại** → `gemini_chat` trả lỗi
+`Unknown model`. Đây đúng là lý do không được hardcode model id: hôm trước còn
+`3.5 Flash-Lite` / `3.1 Pro`, sáng nay đã là `4 Neon`.
+
+→ `verify_served_model.py` được sửa để **tự gọi `gemini_models`** lấy danh sách
+model thay vì hardcode tên. Test cũ sẽ fail vì lý do sai (tên model đổi) chứ không
+phải vì server hỏng.
 
 ### Đã làm
 
