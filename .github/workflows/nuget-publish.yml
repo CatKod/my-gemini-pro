@@ -1,0 +1,193 @@
+name: nuget-publish
+
+# Publishes the MCP server to nuget.org with Trusted Publishing (OIDC).
+#
+# There is no NUGET_API_KEY secret here, and there must never be one. The
+# workflow asks GitHub for a short-lived OIDC token, nuget.org exchanges it for
+# a temporary API key that is valid for one hour, and the push uses that key.
+#
+# One-time setup on nuget.org (account menu -> Trusted Publishing -> Add policy):
+#   Repository Owner : CatKod
+#   Repository       : my-gemini-pro
+#   Workflow File    : nuget-publish.yml   (file name only, no path)
+#   Environment      : leave empty         (this workflow declares no environment)
+#
+# The policy is scoped to the owner, so it covers every package the account
+# owns. It does not need to exist before the first publish of a new package id.
+#
+# The one thing this workflow does need is the nuget.org *profile name* (not the
+# email address) as a repository secret named NUGET_USER. It is not a
+# credential — it only keeps the account name out of the logs.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g. 0.1.0-beta). Defaults to the tag version.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+
+jobs:
+  # The version comes from the tag, or from the manual input. It is resolved
+  # first because every other job needs it.
+  version:
+    name: resolve the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        env:
+          TAG: ${{ github.ref_name }}
+          INPUT: ${{ inputs.version }}
+        run: |
+          version=""
+          if [ -n "$INPUT" ]; then
+            version="$INPUT"
+          elif [ "$TAG" != "" ] && [ "$TAG" != "main" ]; then
+            version="${TAG#v}"
+          fi
+          if [ -z "$version" ]; then
+            echo "No version to publish. Push a v* tag or pass the version input." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # The RID packages carry the actual binaries. Each one is built on a runner
+  # that matches the target: Native AOT cannot cross-compile a Windows binary
+  # from Linux, so the build has to happen where it will run.
+  build:
+    name: build ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    needs: version
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            os: windows-latest
+          - rid: linux-x64
+            os: ubuntu-latest
+          - rid: osx-arm64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # The pdb stays in the package: Native AOT always emits one, and it is
+      # what makes a crash report readable. The package lands at ~20 MB, well
+      # under nuget.org's 100 MB limit.
+      - name: Pack the RID package
+        working-directory: my-geminiweb-mcp
+        run: >
+          dotnet pack my-geminiweb-mcp/my-geminiweb-mcp.csproj
+          -c Release -r ${{ matrix.rid }}
+          -p:PackageVersion=${{ needs.version.outputs.version }}
+          -o artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.rid }}
+          path: my-geminiweb-mcp/artifacts/*.nupkg
+          if-no-files-found: error
+
+  # The tool package is the one users install. It declares no binary of its
+  # own — it points at the RID packages, which is why they have to exist on
+  # nuget.org first.
+  pack-tool:
+    name: pack the tool package
+    runs-on: ubuntu-latest
+    needs: version
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Pack the tool package
+        working-directory: my-geminiweb-mcp
+        run: >
+          dotnet pack my-geminiweb-mcp/my-geminiweb-mcp.csproj
+          -c Release
+          -p:PackageVersion=${{ needs.version.outputs.version }}
+          -o artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-tool
+          path: my-geminiweb-mcp/artifacts/*.nupkg
+          if-no-files-found: error
+
+  publish:
+    name: publish to nuget.org
+    runs-on: ubuntu-latest
+    needs: [version, build, pack-tool]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List the packages
+        run: ls -l artifacts
+
+      # The temporary key is worth one hour, so it is requested right before
+      # the push rather than at the start of the run.
+      - name: NuGet login (OIDC to temporary API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      # The RID packages go first: the tool package depends on them, and
+      # nuget.org rejects a package whose dependency does not exist yet.
+      # nuget.org indexes asynchronously, so the tool package is pushed after a
+      # short wait rather than immediately.
+      #
+      # The tool package is pushed separately, and it is skipped here by name:
+      # every package in the folder starts with "MyGeminiWebMcp.", so a glob
+      # alone cannot tell a RID package from the tool package.
+      - name: Push the RID packages
+        env:
+          TOOL_PACKAGE: MyGeminiWebMcp.${{ needs.version.outputs.version }}.nupkg
+        run: |
+          for package in artifacts/*.nupkg; do
+            name=$(basename "$package")
+            if [ "$name" = "$TOOL_PACKAGE" ]; then
+              echo "skipping the tool package for now: $name"
+              continue
+            fi
+            echo "pushing $name"
+            dotnet nuget push "$package" \
+              --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
+
+      - name: Wait for nuget.org to index the RID packages
+        run: sleep 90
+
+      - name: Push the tool package
+        run: >
+          dotnet nuget push "artifacts/MyGeminiWebMcp.${{ needs.version.outputs.version }}.nupkg"
+          --api-key ${{ steps.login.outputs.NUGET_API_KEY }}
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate

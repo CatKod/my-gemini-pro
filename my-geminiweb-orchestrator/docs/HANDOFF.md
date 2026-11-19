@@ -1863,7 +1863,7 @@ PASS: every reply reported a model
 | `my-geminiweb-mcp/tests/verify_packaged_tool.py` | Cài tool từ `.nupkg` cục bộ và gọi MCP thật ✅ |
 | `.work/probe_served_model.py` | Quét model, in servedModel / quotaNotice / fallbackReason |
 
-### NuGet — package đã sẵn sàng, chỉ còn API key
+### NuGet — package đã sẵn sàng, publish tự động bằng Trusted Publishing
 
 Đã pack **cả 2 gói** (tool package trỏ tới RID package) và **cài + chạy thật** từ
 package cục bộ:
@@ -1882,16 +1882,28 @@ tools: ['gemini_bridge', 'gemini_refresh', 'gemini_chat', 'gemini_check',
 PASS
 ```
 
-Lệnh push (cần `NUGET_API_KEY` từ nuget.org → Profile → API keys):
+**Publish tự động:** `.github/workflows/nuget-publish.yml` dùng **Trusted Publishing
+(OIDC)** — không có API key, không có secret credential. Trigger: push tag `v*` hoặc
+`workflow_dispatch` với input `version`.
 
-```powershell
-dotnet nuget push MyGeminiWebMcp.win-x64.0.1.0-beta.nupkg -s nuget.org -k $env:NUGET_API_KEY
-dotnet nuget push MyGeminiWebMcp.0.1.0-beta.nupkg        -s nuget.org -k $env:NUGET_API_KEY
-```
+Đăng ký policy 1 lần trên nuget.org (*username* → *Trusted Publishing* → *Add policy*):
 
-> Push **RID package trước**, tool package sau — tool package khai báo dependency tới
-> RID package nên RID phải có sẵn trên nuget.org.
+| Trường | Giá trị |
+|---|---|
+| Repository Owner | `CatKod` |
+| Repository | `my-gemini-pro` |
+| Workflow File | `nuget-publish.yml` ← **chỉ tên file**, không có đường dẫn |
+| Environment | **để trống** (workflow không khai báo `environment:`) |
+
+Một secret repo tên `NUGET_USER` = **nuget.org profile name** (không phải email) —
+là tên account sở hữu policy. Không phải credential, chỉ để không lộ tên trong log.
+
+**Thứ tự push trong workflow:** RID package trước → chờ 90s cho nuget.org index →
+tool package sau (tool package phụ thuộc RID package, nuget.org từ chối nếu
+dependency chưa tồn tại).
 
 ### Còn lại
 
-- [ ] Publish lên nuget.org (cần nuget.org API key — package đã pack + verify chạy thật)
+- [ ] Tạo secret `NUGET_USER` trong repo (Settings → Secrets and variables → Actions)
+- [ ] Publish lên nuget.org: tạo tag `v0.1.0-beta` rồi push
+
