@@ -1925,6 +1925,57 @@ dependency chưa tồn tại).
 
 ### Còn lại
 
-- [ ] Tạo secret `NUGET_USER` trong repo (Settings → Secrets and variables → Actions)
-- [ ] Publish lên nuget.org: tạo tag `v0.1.0-beta` rồi push
+- [x] Tạo secret `NUGET_USER` trong repo (Settings → Secrets and variables → Actions)
+- [x] Publish lên nuget.org: tag `v0.1.0-beta` (run `44431601842` ✅) rồi `v0.1.1-beta` (run `44435535407` ✅)
+
+---
+
+## Session 2026-11-19 (buổi 9) — Publish nuget.org qua Trusted Publishing (OIDC)
+
+**Đã publish thật lên nuget.org, không dùng API key dài hạn.**
+
+| Package | Version | Trạng thái |
+|---|---|---|
+| `MyGeminiWebMcp` (tool metapackage) | 0.1.0-beta, 0.1.1-beta | ✅ |
+| `MyGeminiWebMcp.win-x64` | 0.1.0-beta, 0.1.1-beta | ✅ |
+| `MyGeminiWebMcp.osx-arm64` | 0.1.0-beta, 0.1.1-beta | ✅ |
+| `MyGeminiWebMcp.linux-x64` | 0.1.0-beta, 0.1.1-beta | ✅ |
+
+### Kiểm chứng thật (0.1.1-beta, tag `v0.1.1-beta`, run `44435535407`)
+
+```
+$ dotnet tool install MyGeminiWebMcp --version 0.1.1-beta
+Tool 'mygeminiwebmcp' (version '0.1.1-beta') was successfully installed.
+
+$ python tests/... (stdio init + tools/list trên binary trong gói nuget.org)
+INIT: {"result":{"protocolVersion":"2024-11-05",...,"serverInfo":{"name":"my-geminiweb-mcp","version":"1.0.0.0"}}}
+TOOLS: ['gemini_bridge', 'gemini_refresh', 'gemini_chat', 'gemini_check', 'gemini_accounts', 'gemini_models']
+```
+
+### Hai lỗi đã sửa trong quá trình publish
+
+1. **`permissions` ở workflow-level xoá `id-token: write`** → phải khai báo
+   `permissions: { id-token: write, contents: read }` ngay trong job `publish`.
+2. **Metapackage khai báo 6 RID nhưng chỉ publish 3** → `DotnetToolSettings.xml`
+   liệt kê `win-arm64`, `linux-arm64`, `linux-musl-x64` không tồn tại trên nuget.org
+   ⇒ `dotnet tool install` fail trên các máy đó. Đã sửa `my-geminiweb-mcp.csproj`:
+   `<RuntimeIdentifiers>win-x64;osx-arm64;linux-x64</RuntimeIdentifiers>` (commit `6ce75fb`).
+3. **Job `pack-tool` trên Linux sinh thêm gói host-RID** trùng tên với gói của build
+   matrix → thêm step "Drop the host-RID package" xoá file RID trước khi upload
+   artifact, tránh ghi đè im lặng khi merge artifacts.
+
+### Ghi chú vận hành
+
+- nuget.org index **bất đồng bộ**: sau khi push, `flatcontainer/index.json` và
+  `dotnet tool install` có thể chưa thấy version mới trong ~10–20 phút. Đừng push
+  lại vì version đẩy lên rồi mà version đó vẫn không hiện.
+- `dotnet tool install` có thể bị kẹt file lock
+  (`...nupkg because it is being used by another process`) do tiến trình `dotnet`
+  còn treo — kill `dotnet` rồi xoá thư mục package trong `%USERPROFILE%\.nuget\packages`.
+
+### Còn lại
+
+- [ ] Publish thêm RID `win-arm64` / `linux-arm64` / `linux-musl-x64` nếu muốn hỗ trợ
+      đầy đủ (mỗi RID cần 1 runner đúng OS vì Native AOT không cross-compile).
+- [ ] Chuyển `MyGeminiWebMcp` sang verified owner / reserve package id.
 
