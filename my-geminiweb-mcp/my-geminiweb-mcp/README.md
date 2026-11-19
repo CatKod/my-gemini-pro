@@ -277,7 +277,7 @@ extension only reads `.google.com` cookies and only posts to `127.0.0.1`.
 dotnet publish -c Release -r win-x64
 ```
 
-Targets: `win-x64`, `win-arm64`, `osx-arm64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`.
+Targets: `win-x64`, `osx-arm64`, `linux-x64`.
 
 ```bash
 dotnet pack -c Release
