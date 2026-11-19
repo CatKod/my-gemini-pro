@@ -165,7 +165,7 @@ Or, from VS Code / Visual Studio, use `dnx`:
     "geminiweb": {
       "type": "stdio",
       "command": "dnx",
-      "args": ["MyGeminiWebMcp", "--version", "0.1.0-beta", "--yes"]
+      "args": ["MyGeminiWebMcp", "--version", "0.1.1-beta", "--yes"]
     }
   }
 }

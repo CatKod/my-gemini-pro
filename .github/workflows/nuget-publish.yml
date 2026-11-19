@@ -131,6 +131,22 @@ jobs:
           -p:PackageVersion=${{ needs.version.outputs.version }}
           -o artifacts
 
+      # On a Linux runner `dotnet pack` (without -r) also emits a package for
+      # the host RID. It has the same file name as the one the build matrix
+      # produced, and the artifacts are merged into one folder before the
+      # push, so it has to go or it silently overwrites the matrix build.
+      # The tool package itself carries no RID in its file name.
+      - name: Drop the host-RID package
+        working-directory: my-geminiweb-mcp
+        run: >
+          rm -f
+          artifacts/MyGeminiWebMcp.win-x64.*.nupkg
+          artifacts/MyGeminiWebMcp.win-arm64.*.nupkg
+          artifacts/MyGeminiWebMcp.osx-arm64.*.nupkg
+          artifacts/MyGeminiWebMcp.linux-x64.*.nupkg
+          artifacts/MyGeminiWebMcp.linux-arm64.*.nupkg
+          artifacts/MyGeminiWebMcp.linux-musl-x64.*.nupkg
+
       - uses: actions/upload-artifact@v4
         with:
           name: package-tool
